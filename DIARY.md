@@ -21,6 +21,7 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | 2 | Tests for refusal and send errors (scripted bus); liveness analysis | all |
 | 2.5 | Liveness: fail a run that ends a scan with nothing in flight | all |
 | 3 | Going further: bounded retries of retryable failures | all + manual fault runs |
+| 4 | Going further: lost results (DROP) — reconcile loop, fail fast | all + manual drop run |
 | 4 | NOTES.md, drafted from this diary | — |
 
 ---
@@ -335,5 +336,89 @@ nothing on the run said which step had stopped it.
   where each would have failed without retries. Each is flagged by check 5
   ("steps executed more than once") for the retried incubator step — the
   intended trade-off.
+
+**Time:** ~
+
+---
+
+## Round 4 — lost results (DROP): reconcile loop, fail fast
+
+Design discussed first, recorded in `docs/drops.md`.
+
+**Done**
+- `reconciler.go`: `RunReconciler` (started from `main`, every 1s) →
+  `reconcile` → `reconcileSteps`. Snapshot in-flight steps, then query each
+  device's `DriverState` (outside the mutex), then under the mutex: a step
+  whose device is not busy with it is suspected; still so `lostGrace` (1s)
+  later, it fails as "result lost: … outcome unknown" and the run is advanced
+  (fails, or drains).
+- `Scheduler` gains `now` (injectable clock) and `suspected`, keyed by
+  `(step, attempt)`.
+- Store: `ListInFlightSteps` (running steps of running / draining runs),
+  `RecordStepLost` (conditional on status *and* `dispatch_count`).
+- Harness: scripted `DriverState` per device, fake clock, `driverBusy` /
+  `driverIdle` (Executed built from accepted commands, as a real driver),
+  `reconcile` restricted to the test's own run.
+- `reconciler_test.go`, 8 tests: dropped → fails after grace; late result
+  within grace wins; busy step never lost; retry starts a fresh suspicion;
+  dropped result on a draining run ends it; unreachable driver → no verdict;
+  driver with no record → distinct message; stale snapshot cannot fail a new
+  attempt. Checked by breaking the grace, the attempt key, and the
+  attempt-conditional update: each caught.
+
+**Decisions**
+- Reconcile loop over per-step deadlines (durations unknown to the executor).
+- Fail fast on a lost result (outcome unknown), consistent with send errors.
+- "Not busy with this step" + grace is the whole rule; `Executed` only
+  refines the message. No ID counting needed for correctness.
+- Executor restarts out of scope (agreed).
+- `reconcile` split into list + `reconcileSteps` so tests can scope it to
+  their own run: the test DB is shared with other tests' runs and a live
+  executor.
+
+**Database errors — `abandon` kept, typed** (review of reconciler.go:105)
+- Every DB error still abandons the run (fail closed); agreed as fine for
+  this exercise. Analysis of the alternative (log + retry from the loop):
+  reads and our own decisions are safe to redo, but a failed write of a
+  driver's *acceptance* is not — a rescan would re-send a step the instrument
+  is running. Proper fix is the write-ahead `dispatched` state; not built.
+  Recorded in `docs/liveness.md` §2.
+- The run's error is now always `<type>: <what we were doing>: <cause>`,
+  e.g. `database error: recording result for fill_sample_plate: recording
+  step completed: context canceled`. The type is passed explicitly at each
+  call site (`errTypeDatabase` is the only one today); store errors inside
+  `advance` / `record` are wrapped with the operation.
+- `abandon` records the failure with `context.WithoutCancel`: with the
+  caller's context it silently failed to record anything when that context
+  was the thing that failed (a test proved it: run stayed `running`).
+- `Start` detaches from the HTTP request's context: a client hanging up
+  mid-start must not abandon the run, or have it misreported as a database
+  error.
+- Test: `TestDatabaseErrorAbandonsRunWithTypedReason` — a cancelled context
+  makes the store fail for real; the run fails with the typed reason.
+- *If `abandon` cannot record the failure either, the executor exits*
+  (`log.Fatalf`, injectable as `Scheduler.fatal` for tests). Fail-stop: the
+  table may not match the instruments, and scheduling on could send a step
+  twice. No restart policy, so it stays down for an operator.
+  Test: `TestAbandonExitsWhenFailureCannotBeRecorded` (scheduler over a
+  closed DB). Live: stopped Postgres 0.5s into a run → the liquid handler's
+  result could not be recorded or abandoned → executor exited 1 with the full
+  error chain. After restarting Postgres and the executor, the reconcile loop
+  failed the run within seconds: `result lost: liquid-handler-1 finished
+  fill_sample_plate (attempt 1) but never reported; outcome unknown`.
+
+**Found along the way**
+- A first version of a test forgot to script the liquid handler; the default
+  fake driver reports idle, and the reconciler (correctly) failed the step.
+- The live executor, on start, failed ~50 runs that tests had left
+  non-terminal — correct, and a reason tests should get their own database.
+
+**Gates**
+- all pass: static, `go test -race` (28 tests + 2 subtests), live 5/5 on
+  both workflows (10s / 6s, 0 refusals, no reconcile activity on live runs),
+  failure pass.
+- Manual, `INC_DROP_PCT=100`: run failed at 6.98s with `result lost:
+  incubator-1 finished incubate_samples (attempt 1) but never reported;
+  outcome unknown` (incubator finished at ~4s); previously hung for ever.
 
 **Time:** ~

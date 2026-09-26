@@ -97,14 +97,30 @@ can be:
 
 ### 2. `abandon` cannot persist the failure
 
-If the database is unavailable, `abandon` logs and tries to fail the run; if
-that write fails too, the run stays `running` with nothing driving it.
+Every error that reaches `abandon` is a database error (driver errors are step
+failures). `abandon` fails the run with `database error: <what we were
+doing>: <cause>`, recorded even if the caller's context was cancelled.
+
+If the database is unavailable, that write fails too. **The executor then
+exits** (fail-stop). Its table may no longer match the instruments — if the
+failed write was a driver's *acceptance* (`RecordStepRunning`), the step reads
+`pending` while the instrument runs it, and the next scan would send it again,
+a double execution. Stopping prevents that. Nothing restarts the executor
+automatically (no restart policy in compose).
+
+After a manual restart the reconcile loop resolves what it can: a step left
+`running` whose driver is idle is failed as a lost result (observed live:
+Postgres stopped mid-run → executor exited → restarted → run `failed`,
+`result lost: … outcome unknown`). A step left `pending` while it actually
+ran is not detectable, and a restart could send it again. The proper fix is
+the write-ahead `dispatched` state (claim before sending, see
+driver-interaction.md).
 
 ## Where A does not hold
 
 | Cause | Effect |
 |---|---|
-| `*_DROP_PCT`: instrument does the work, never reports | step `running` forever. I holds vacuously; the run never moves |
+| `*_DROP_PCT`: instrument does the work, never reports | step `running` forever. I holds vacuously; the run never moves. **Handled (round 4):** the reconcile loop fails the step as outcome unknown — see [drops.md](drops.md) |
 | Executor down or NATS disconnected when a result is published | core NATS is at-most-once: the result is gone |
 | DB error while recording a result | the message is already consumed; nothing redelivers it |
 | Panic in a result handler | the process dies — the restart case above |
@@ -129,5 +145,5 @@ of wake-ups that does not depend on a driver reporting.
 | §1 refusal stall | handled — run fails immediately; timer (full R1) deferred to drop handling |
 | §1 two concurrent runs | handled the same way — the second run fails with the refusal as its reason. R2 not planned: one run at a time is an assumption of this exercise |
 | §2 abandon cannot persist | accepted — needs the database back; R4 would recover |
-| A: drops | open — R3 not planned; described in NOTES.md |
+| A: drops | handled — reconcile loop (R3's check, R4's trigger), fail fast; see drops.md |
 | A: restarts, lost results | accepted — R4 not planned; described in NOTES.md |

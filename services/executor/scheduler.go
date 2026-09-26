@@ -8,6 +8,7 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"time"
 )
 
 // maxAttempts bounds how many times a step is run when its driver keeps
@@ -32,19 +33,30 @@ const maxAttempts = 3
 //     cancelled, the run is failed_draining until they report, then failed.
 //   - Except: a failed step the driver calls retryable is sent again, up to
 //     maxAttempts in all, while the run is still running.
+//   - Results can be lost. A reconcile loop (reconciler.go) compares running
+//     steps with what their drivers report, and fails a step whose driver has
+//     finished with it but never reported.
 type Scheduler struct {
 	store *Store
 	bus   Bus
+	now   func() time.Time
+	fatal func(format string, args ...any) // log.Fatalf; see abandon
 
-	mu sync.Mutex
+	mu        sync.Mutex
+	suspected map[attempt]time.Time // guarded by mu; see reconciler.go
 }
 
 func NewScheduler(store *Store, bus Bus) *Scheduler {
-	return &Scheduler{store: store, bus: bus}
+	return &Scheduler{store: store, bus: bus, now: time.Now, fatal: log.Fatalf,
+		suspected: make(map[attempt]time.Time)}
 }
 
 // Start begins executing a run.
 func (s *Scheduler) Start(ctx context.Context, runID string) error {
+	// ctx is the HTTP request's. A client hanging up must not abandon the run
+	// half-dispatched (and be misreported as a database error).
+	ctx = context.WithoutCancel(ctx)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -52,7 +64,8 @@ func (s *Scheduler) Start(ctx context.Context, runID string) error {
 		return err
 	}
 	if err := s.advance(ctx, runID); err != nil {
-		s.abandon(ctx, runID, err)
+		err = fmt.Errorf("scheduling run after start: %w", err)
+		s.abandon(ctx, runID, errTypeDatabase, err)
 		return err
 	}
 	return nil
@@ -66,7 +79,8 @@ func (s *Scheduler) HandleResult(ctx context.Context, res StepResult) {
 
 	recorded, status, err := s.record(ctx, res)
 	if err != nil {
-		s.abandon(ctx, res.RunID, fmt.Errorf("record result for %s: %w", res.StepName, err))
+		s.abandon(ctx, res.RunID, errTypeDatabase,
+			fmt.Errorf("recording result for %s: %w", res.StepName, err))
 		return
 	}
 	if !recorded {
@@ -77,7 +91,8 @@ func (s *Scheduler) HandleResult(ctx context.Context, res StepResult) {
 	log.Printf("scheduler: %s on %s finished as %s", res.StepName, res.DeviceID, status)
 
 	if err := s.advance(ctx, res.RunID); err != nil {
-		s.abandon(ctx, res.RunID, err)
+		s.abandon(ctx, res.RunID, errTypeDatabase,
+			fmt.Errorf("scheduling after result for %s: %w", res.StepName, err))
 	}
 }
 
@@ -91,7 +106,10 @@ func (s *Scheduler) HandleResult(ctx context.Context, res StepResult) {
 func (s *Scheduler) record(ctx context.Context, res StepResult) (bool, string, error) {
 	if res.Error == "" {
 		ok, err := s.store.RecordStepFinished(ctx, res.RunID, res.StepID, StepCompleted, "")
-		return ok, StepCompleted, err
+		if err != nil {
+			return false, "", fmt.Errorf("recording step completed: %w", err)
+		}
+		return ok, StepCompleted, nil
 	}
 
 	msg := res.Error
@@ -101,11 +119,11 @@ func (s *Scheduler) record(ctx context.Context, res StepResult) (bool, string, e
 			return false, "", nil // not a step of this run
 		}
 		if err != nil {
-			return false, "", err
+			return false, "", fmt.Errorf("reading step: %w", err)
 		}
 		run, err := s.store.GetRun(ctx, res.RunID)
 		if err != nil {
-			return false, "", err
+			return false, "", fmt.Errorf("reading run: %w", err)
 		}
 		switch {
 		case run.Status != RunRunning:
@@ -115,11 +133,17 @@ func (s *Scheduler) record(ctx context.Context, res StepResult) (bool, string, e
 		default:
 			msg = fmt.Sprintf("%s (attempt %d of %d, retrying)", res.Error, step.DispatchCount, maxAttempts)
 			ok, err := s.store.RecordStepRetrying(ctx, res.RunID, res.StepID, msg)
-			return ok, "retrying", err
+			if err != nil {
+				return false, "", fmt.Errorf("recording step retrying: %w", err)
+			}
+			return ok, "retrying", nil
 		}
 	}
 	ok, err := s.store.RecordStepFinished(ctx, res.RunID, res.StepID, StepFailed, msg)
-	return ok, StepFailed, err
+	if err != nil {
+		return false, "", fmt.Errorf("recording step failed: %w", err)
+	}
+	return ok, StepFailed, nil
 }
 
 // advance looks at the whole run and does whatever is due: finish the run if
@@ -128,7 +152,7 @@ func (s *Scheduler) record(ctx context.Context, res StepResult) (bool, string, e
 func (s *Scheduler) advance(ctx context.Context, runID string) error {
 	run, err := s.store.GetRun(ctx, runID)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading run: %w", err)
 	}
 	if run.Status != RunRunning && run.Status != RunFailedDraining {
 		return nil // over; a late result is recorded but moves nothing
@@ -136,7 +160,7 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 
 	steps, err := s.store.ListSteps(ctx, runID)
 	if err != nil {
-		return err
+		return fmt.Errorf("listing steps: %w", err)
 	}
 
 	status := make(map[string]string, len(steps))
@@ -160,7 +184,9 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 	if run.Status == RunFailedDraining {
 		if len(busy) == 0 {
 			log.Printf("scheduler: run %s drained, now failed", runID)
-			return s.store.FinishRun(ctx, runID, RunFailedDraining, RunFailed)
+			if err := s.store.FinishRun(ctx, runID, RunFailedDraining, RunFailed); err != nil {
+				return fmt.Errorf("finishing drained run: %w", err)
+			}
 		}
 		return nil
 	}
@@ -173,7 +199,10 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 	}
 	if completed == len(steps) {
 		log.Printf("scheduler: run %s completed", runID)
-		return s.store.FinishRun(ctx, runID, RunRunning, RunCompleted)
+		if err := s.store.FinishRun(ctx, runID, RunRunning, RunCompleted); err != nil {
+			return fmt.Errorf("completing run: %w", err)
+		}
+		return nil
 	}
 
 	refused := make(map[string]bool) // devices that refused during this scan
@@ -209,7 +238,7 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 			continue
 		}
 		if err := s.store.RecordStepRunning(ctx, st.ID); err != nil {
-			return fmt.Errorf("record %s running: %w", st.Name, err)
+			return fmt.Errorf("recording %s running: %w", st.Name, err)
 		}
 		busy[st.DeviceID] = true
 		log.Printf("scheduler: dispatched %s to %s", st.Name, st.DeviceID)
@@ -225,7 +254,7 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 		}
 		for _, st := range refusals {
 			if err := s.store.RecordDispatchFailed(ctx, st.ID, *st.Error); err != nil {
-				return fmt.Errorf("record refusal of %s: %w", st.Name, err)
+				return fmt.Errorf("recording refusal of %s: %w", st.Name, err)
 			}
 		}
 		return s.fail(ctx, runID, refusals[0].Name, *refusals[0].Error, 0)
@@ -242,17 +271,34 @@ func (s *Scheduler) fail(ctx context.Context, runID, stepName, reason string, in
 	}
 	log.Printf("scheduler: run %s %s: %s: %s (%d step(s) still on instruments)",
 		runID, status, stepName, reason, inFlight)
-	return s.store.FailRun(ctx, runID, status, stepName, reason)
+	if err := s.store.FailRun(ctx, runID, status, stepName, reason); err != nil {
+		return fmt.Errorf("failing run: %w", err)
+	}
+	return nil
 }
 
-// abandon is the last resort when the scheduler itself cannot make progress,
-// e.g. the database is unreachable: log, and try to fail the run rather than
-// leave it running with nothing driving it. No step is to blame, and whether
-// anything is still on an instrument is unknown, so it goes straight to failed.
-func (s *Scheduler) abandon(ctx context.Context, runID string, cause error) {
-	log.Printf("scheduler: run %s: %v", runID, cause)
-	if err := s.store.FailRun(ctx, runID, RunFailed, "", "scheduler error: "+cause.Error()); err != nil {
-		log.Printf("scheduler: could not fail run %s: %v", runID, err)
+// errTypeDatabase is the error type of every abandon today: advance, record
+// and the reconciler only fail when a store call does. Driver errors never get
+// here -- they are step failures.
+const errTypeDatabase = "database error"
+
+// abandon is the last resort when the scheduler itself cannot make progress:
+// fail the run rather than leave it running with nothing driving it. The run's
+// error reads "<errType>: <cause>". No step is to blame, and whether anything
+// is still on an instrument is unknown, so it goes straight to failed.
+//
+// If even that cannot be recorded, the executor exits. Its table no longer
+// matches the instruments -- a step a driver accepted may still read pending
+// -- and carrying on could send such a step again. Stopping is the safe
+// failure; nothing restarts the executor automatically.
+func (s *Scheduler) abandon(ctx context.Context, runID, errType string, cause error) {
+	reason := errType + ": " + cause.Error()
+	log.Printf("scheduler: run %s failed: %s", runID, reason)
+	// The failure is recorded even if the caller's context is what failed.
+	ctx = context.WithoutCancel(ctx)
+	if err := s.store.FailRun(ctx, runID, RunFailed, "", reason); err != nil {
+		s.fatal("scheduler: cannot record failure of run %s (%s): %v -- stopping rather than schedule from state that may not match the instruments",
+			runID, reason, err)
 	}
 }
 

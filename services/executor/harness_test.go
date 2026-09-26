@@ -6,10 +6,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 )
 
 // pcrTemplate is the default workflow's shape, fixed here so these tests do not
@@ -35,6 +37,7 @@ type runHarness struct {
 	bus   *scriptedBus
 	sched *Scheduler
 	runID string
+	clock time.Time // the scheduler's now
 }
 
 func newRunHarness(t *testing.T, script map[string][]reply) *runHarness {
@@ -57,7 +60,9 @@ func newRunHarness(t *testing.T, script map[string][]reply) *runHarness {
 	}
 	bus := &scriptedBus{script: script}
 	h := &runHarness{t: t, ctx: ctx, store: store, bus: bus,
-		sched: NewScheduler(store, bus), runID: run.ID}
+		sched: NewScheduler(store, bus), runID: run.ID,
+		clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	h.sched.now = func() time.Time { return h.clock }
 	if err := h.sched.Start(ctx, run.ID); err != nil {
 		t.Fatalf("start run: %v", err)
 	}
@@ -176,6 +181,13 @@ type scriptedBus struct {
 	script   map[string][]reply
 	attempts []string      // every command offered, by step name
 	accepted []StepCommand // commands a driver took
+	states   map[string]driverAnswer
+}
+
+// driverAnswer is what DriverState returns for a device.
+type driverAnswer struct {
+	state DriverState
+	err   error
 }
 
 func (b *scriptedBus) SendCommand(ctx context.Context, cmd StepCommand) (CommandAck, error) {
@@ -194,8 +206,24 @@ func (b *scriptedBus) SendCommand(ctx context.Context, cmd StepCommand) (Command
 
 func (b *scriptedBus) OnStepResult(func(context.Context, StepResult)) error { return nil }
 
+// DriverState answers as scripted by setState. An unscripted device is idle
+// with nothing executed.
 func (b *scriptedBus) DriverState(ctx context.Context, deviceID string) (DriverState, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if a, ok := b.states[deviceID]; ok {
+		return a.state, a.err
+	}
 	return DriverState{DeviceID: deviceID}, nil
+}
+
+func (b *scriptedBus) setState(deviceID string, a driverAnswer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.states == nil {
+		b.states = make(map[string]driverAnswer)
+	}
+	b.states[deviceID] = a
 }
 
 func (b *scriptedBus) Close() {}
@@ -211,3 +239,55 @@ func (b *scriptedBus) tried() []string {
 	defer b.mu.Unlock()
 	return slices.Clone(b.attempts)
 }
+
+// executedOn is what a real driver reports as Executed: the ID of every
+// command it accepted.
+func (h *runHarness) executedOn(device string) []string {
+	var ids []string
+	for _, c := range h.bus.sent() {
+		if c.DeviceID == device {
+			ids = append(ids, c.StepID)
+		}
+	}
+	return ids
+}
+
+// driverBusy makes device report it is working on stepName.
+func (h *runHarness) driverBusy(device, stepName string) {
+	h.bus.setState(device, driverAnswer{state: DriverState{DeviceID: device,
+		Busy: true, CurrentStep: stepName, Executed: h.executedOn(device)}})
+}
+
+// driverIdle makes device report it is idle, having executed everything it
+// accepted -- what a driver looks like after dropping a result.
+func (h *runHarness) driverIdle(device string) {
+	h.bus.setState(device, driverAnswer{state: DriverState{DeviceID: device,
+		Executed: h.executedOn(device)}})
+}
+
+func (h *runHarness) tick(d time.Duration) { h.clock = h.clock.Add(d) }
+
+// reconcile runs one reconcile pass over this run's in-flight steps only: the
+// database is shared with other tests' runs, and with a live executor.
+func (h *runHarness) reconcile() {
+	h.t.Helper()
+	h.sched.reconcileSteps(h.ctx, h.inFlight())
+}
+
+// inFlight is this run's share of what the reconcile loop would read.
+func (h *runHarness) inFlight() []Step {
+	h.t.Helper()
+	all, err := h.store.ListInFlightSteps(h.ctx)
+	if err != nil {
+		h.t.Fatalf("list in-flight steps: %v", err)
+	}
+	var mine []Step
+	for _, st := range all {
+		if st.RunID == h.runID {
+			mine = append(mine, st)
+		}
+	}
+	return mine
+}
+
+var errUnreachable = errors.New("state of device: nats: timeout")

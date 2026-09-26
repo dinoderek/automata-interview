@@ -55,6 +55,10 @@ func main() {
 		log.Fatalf("Failed to subscribe to step results: %v", err)
 	}
 
+	// Results can be lost; the reconcile loop notices steps whose result never
+	// came. See reconciler.go.
+	go sched.RunReconciler(context.Background())
+
 	h := NewHandlers(store, sched, workflowsPath)
 
 	mux := http.NewServeMux()

@@ -1,8 +1,9 @@
 # Principles / Limitations / Decisions
 
 * One workflow running per executor
-* Does not handle executor crashes
+* Does not handle gracefully executor crashes, restarts with pending runs or busy drivers
 * Fail fast when environemnt does not match expectations
+* Fail fast on database errors
 
 
 # Step 0 - Setup
@@ -27,6 +28,10 @@ Simplest approach would be to fail when a device is busy when we expect free. We
 
 # Step 3 - Retries
 
-OK with limitations (no retry logs, no wait before retry)
+OK with limitations (no retry logs, no wait before retry, retries not configurable)
 
 # Step 4 - Drop
+
+Devices are quite limited as designed - in particular it is not possible to know the outcome of the last operation (success/failure). Given this the best we can do is to determine whether the Step is still running on the device and if it is not we fail. I'm not sure this was aligned with the README, where it says "the device does its job". 
+
+Did some refinement of the "system error" case, where we crash becu

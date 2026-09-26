@@ -240,6 +240,44 @@ func (s *Store) RecordStepRetrying(ctx context.Context, runID, stepID, errMsg st
 	return n == 1, err
 }
 
+// ListInFlightSteps returns every running step of a run that is still being
+// driven (running or failed_draining): the steps waiting on a driver's result.
+func (s *Store) ListInFlightSteps(ctx context.Context) ([]Step, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+stepCols+` FROM steps
+		  WHERE status = $1
+		    AND run_id IN (SELECT id FROM runs WHERE status IN ($2, $3))
+		  ORDER BY run_id, name`, StepRunning, RunRunning, RunFailedDraining)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Step{}
+	for rows.Next() {
+		st, err := scanStep(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *st)
+	}
+	return out, rows.Err()
+}
+
+// RecordStepLost fails a running step whose result never arrived. It applies
+// only while the step is still on the same attempt: if the result came in, or
+// a retry went out, since the step was judged lost, it reports false.
+func (s *Store) RecordStepLost(ctx context.Context, runID, stepID string, attempt int, errMsg string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
+		 WHERE id = $3 AND run_id = $4 AND status = $5 AND dispatch_count = $6`,
+		StepFailed, nullable(errMsg), stepID, runID, StepRunning, attempt)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // RecordDispatchFailed fails a pending step whose command could not be
 // delivered or answered. The driver may or may not have taken it.
 func (s *Store) RecordDispatchFailed(ctx context.Context, stepID, errMsg string) error {
