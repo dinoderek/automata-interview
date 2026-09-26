@@ -50,6 +50,10 @@ We went beyond the four floor requirements:
 - Failing runs left active at startup
 - SendCommand outside of mutex loop allows for higher concurrency / less wait time between steps
 
+### Something I would perhaps change
+
+ Handling DROP and moving SendCommand our of the lock significanlty increased complexity - I would be more comfortable with more time to review the code and the architecture that what I had in this exercise. You can get a sense of the change of complexity by looking at the commit history. That said I felt DROP handling was one of the most interesting problems to address, I felt that adding a up to 3 second wait for a RPC in a mutex-holding loop were gaps that were too big to leave there and the testing coverage is good.
+
 ### AI Conversation
 
 - Kept a log in DIARY.md plus my own log in HUMAN_DIARY.md - not a line by line transcript though
