@@ -4,7 +4,7 @@
 #   ./scripts/gates.sh            # static + test
 #   ./scripts/gates.sh static     # gofmt, go vet, go build (no Docker needed)
 #   ./scripts/gates.sh test       # go test -race against Postgres (docker compose)
-#   ./scripts/gates.sh live       # rebuild executor, both acceptance workflows
+#   ./scripts/gates.sh live       # rebuild + start stack, both acceptance workflows
 #   ./scripts/gates.sh failure    # check-failure.sh (restarts incubator-1)
 #   ./scripts/gates.sh all        # everything
 #
@@ -35,8 +35,8 @@ test_() {
 }
 
 live() {
-  step "rebuild executor"
-  docker compose up -d --build --wait executor
+  step "rebuild and start the stack"
+  docker compose up -d --build --wait
   step "acceptance: default workflow"
   ./scripts/acceptance.sh
   step "acceptance: Triple Assay"

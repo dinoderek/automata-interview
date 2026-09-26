@@ -11,7 +11,10 @@ import (
 	"github.com/lib/pq"
 )
 
-var ErrRunNotFound = errors.New("run not found")
+var (
+	ErrRunNotFound   = errors.New("run not found")
+	ErrRunNotPending = errors.New("run is not pending")
+)
 
 func newID(prefix string) string {
 	b := make([]byte, 6)
@@ -147,40 +150,81 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
 	return out, rows.Err()
 }
 
+// StartRun moves a run from pending to running. It returns ErrRunNotPending if
+// the run was already started, so a run is only ever scheduled from scratch once.
 func (s *Store) StartRun(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE runs SET status = $1, started_at = now(), updated_at = now()
 		 WHERE id = $2 AND status = $3`, RunRunning, id, RunPending)
-	return err
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, ErrRunNotPending)
 }
 
+// FinishRun ends a running run. A run that has already ended is left alone.
 func (s *Store) FinishRun(ctx context.Context, id, status string) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE runs SET status = $1, finished_at = now(), updated_at = now()
-		 WHERE id = $2`, status, id)
+		 WHERE id = $2 AND status = $3`, status, id, RunRunning)
 	return err
 }
 
-// RecordStepDispatched notes that a step has been sent to its driver.
-func (s *Store) RecordStepDispatched(ctx context.Context, stepID string) error {
-	_, err := s.db.ExecContext(ctx,
+// RecordStepRunning notes that a driver accepted a pending step. dispatched_at
+// is only stamped here, on acceptance, because the timeline treats it as the
+// moment the step started occupying its device.
+func (s *Store) RecordStepRunning(ctx context.Context, stepID string) error {
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE steps
 		    SET status = $1,
 		        dispatch_count = dispatch_count + 1,
 		        dispatched_at = COALESCE(dispatched_at, now()),
 		        updated_at = now()
-		  WHERE id = $2`, StepDispatched, stepID)
+		  WHERE id = $2 AND status = $3`, StepRunning, stepID, StepPending)
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, fmt.Errorf("step %s was not pending", stepID))
+}
+
+// RecordStepFinished records a driver's result for a running step, successful
+// or not. It reports false, and changes nothing, if the step was not running in
+// that run -- a duplicate, late or foreign result.
+func (s *Store) RecordStepFinished(ctx context.Context, runID, stepID, status, errMsg string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
+		 WHERE id = $3 AND run_id = $4 AND status = $5`,
+		status, nullable(errMsg), stepID, runID, StepRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// RecordDispatchFailed fails a pending step whose command could not be
+// delivered or answered. The driver may or may not have taken it.
+func (s *Store) RecordDispatchFailed(ctx context.Context, stepID, errMsg string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
+		 WHERE id = $3 AND status = $4`, StepFailed, nullable(errMsg), stepID, StepPending)
 	return err
 }
 
-// RecordStepFinished notes that a step finished, successfully or not.
-func (s *Store) RecordStepFinished(ctx context.Context, stepID, status, errMsg string) error {
-	var e *string
-	if errMsg != "" {
-		e = &errMsg
+func nullable(s string) *string {
+	if s == "" {
+		return nil
 	}
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
-		 WHERE id = $3`, status, e, stepID)
-	return err
+	return &s
+}
+
+func requireOneRow(res sql.Result, errIfNone error) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errIfNone
+	}
+	return nil
 }

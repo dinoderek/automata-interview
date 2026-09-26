@@ -2,35 +2,31 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"sort"
+	"sync"
 )
 
-// Scheduler is the part you need to build.
+// Scheduler owns the question "what should be running right now, and on what?".
 //
-// It owns the question "what should be running right now, and on what?". The
-// executor gives it two entry points:
+// Design (see docs/driver-interaction.md and DIARY.md):
 //
-//   - Start is called when someone starts a run.
-//   - HandleResult is called every time a driver reports a step finished.
-//     These may be called concurrently.
-//
-// What it has to do:
-//
-//   - Run every step of the DAG exactly once, respecting depends_on.
-//   - Run independent branches at the same time. A run that could take 10
-//     seconds should not take 14.
-//   - Respect the drivers. A driver does one thing at a time and will refuse a
-//     command while it is busy (CommandAck.Accepted == false). Refusals are not
-//     fatal, but a step that gets refused and forgotten stalls the run.
-//   - Move the run to completed, or failed if a step fails.
-//
-// Check your work with ./scripts/acceptance.sh.
-//
-// The Store and Bus are yours to extend -- add methods, change the schema in
-// db/init.sql, whatever you need. Nothing outside this file has to stay as it is.
+//   - One run at a time is assumed.
+//   - Every decision happens under one mutex, held across decide -> send ->
+//     record outcome. That is what stops two simultaneous results both deciding
+//     the same step is runnable, and it is why steps need no "dispatched" state:
+//     nothing can observe a step between being chosen and its outcome recorded.
+//   - Each Start and each result triggers a full rescan of the run's steps.
+//   - A device is busy if one of our steps is running on it. We do not send it
+//     more work until that step's result arrives.
+//   - Any driver error fails the run: a result with an error, or a command that
+//     could not be delivered or answered.
 type Scheduler struct {
 	store *Store
 	bus   Bus
+
+	mu sync.Mutex
 }
 
 func NewScheduler(store *Store, bus Bus) *Scheduler {
@@ -39,20 +35,190 @@ func NewScheduler(store *Store, bus Bus) *Scheduler {
 
 // Start begins executing a run.
 func (s *Scheduler) Start(ctx context.Context, runID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if err := s.store.StartRun(ctx, runID); err != nil {
 		return err
 	}
-
-	// TODO: work out which steps can run now, and get them going.
-	log.Printf("scheduler: run %s started, but nothing is scheduled yet", runID)
-
+	if err := s.advance(ctx, runID); err != nil {
+		s.abandon(ctx, runID, err)
+		return err
+	}
 	return nil
 }
 
 // HandleResult records that a driver finished a step and moves the run on.
 // May be called concurrently.
 func (s *Scheduler) HandleResult(ctx context.Context, res StepResult) {
-	// TODO: record the result, then work out what can run now.
-	log.Printf("scheduler: driver %s reported %s finished, and nothing happened",
-		res.DeviceID, res.StepName)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	status := StepCompleted
+	if res.Error != "" {
+		status = StepFailed
+	}
+	recorded, err := s.store.RecordStepFinished(ctx, res.RunID, res.StepID, status, res.Error)
+	if err != nil {
+		s.abandon(ctx, res.RunID, fmt.Errorf("record result for %s: %w", res.StepName, err))
+		return
+	}
+	if !recorded {
+		log.Printf("scheduler: ignoring result for %s (%s): not a running step of run %s",
+			res.StepName, res.StepID, res.RunID)
+		return
+	}
+	log.Printf("scheduler: %s on %s finished as %s", res.StepName, res.DeviceID, status)
+
+	if err := s.advance(ctx, res.RunID); err != nil {
+		s.abandon(ctx, res.RunID, err)
+	}
+}
+
+// advance looks at the whole run and does whatever is due: finish the run if
+// it is done, otherwise dispatch every step that is ready and whose device is
+// free. Must be called with s.mu held.
+func (s *Scheduler) advance(ctx context.Context, runID string) error {
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != RunRunning {
+		return nil // already ended; late results are recorded but move nothing
+	}
+
+	steps, err := s.store.ListSteps(ctx, runID)
+	if err != nil {
+		return err
+	}
+
+	status := make(map[string]string, len(steps))
+	busy := make(map[string]bool)
+	completed := 0
+	for _, st := range steps {
+		status[st.Name] = st.Status
+		switch st.Status {
+		case StepRunning:
+			busy[st.DeviceID] = true
+		case StepCompleted:
+			completed++
+		case StepFailed:
+			return s.finish(ctx, runID, RunFailed)
+		}
+	}
+	if completed == len(steps) {
+		return s.finish(ctx, runID, RunCompleted)
+	}
+
+	for _, st := range readyByPriority(steps, status) {
+		if busy[st.DeviceID] {
+			continue
+		}
+		ack, err := s.bus.SendCommand(ctx, StepCommand{
+			RunID: runID, StepID: st.ID, StepName: st.Name, DeviceID: st.DeviceID,
+		})
+		if err != nil {
+			// The driver may or may not have taken it. Fail rather than risk
+			// running it twice.
+			msg := fmt.Sprintf("dispatch failed, outcome unknown: %v", err)
+			if rerr := s.store.RecordDispatchFailed(ctx, st.ID, msg); rerr != nil {
+				log.Printf("scheduler: record dispatch failure for %s: %v", st.Name, rerr)
+			}
+			log.Printf("scheduler: %s", msg)
+			return s.finish(ctx, runID, RunFailed)
+		}
+		if !ack.Accepted {
+			// Our own records say the device is free, so something we do not
+			// know about is using it. The step stays pending and is looked at
+			// again on the next result.
+			log.Printf("scheduler: %s refused %s: %s", st.DeviceID, st.Name, ack.Reason)
+			continue
+		}
+		if err := s.store.RecordStepRunning(ctx, st.ID); err != nil {
+			return fmt.Errorf("record %s running: %w", st.Name, err)
+		}
+		busy[st.DeviceID] = true
+		log.Printf("scheduler: dispatched %s to %s", st.Name, st.DeviceID)
+	}
+	return nil
+}
+
+func (s *Scheduler) finish(ctx context.Context, runID, status string) error {
+	log.Printf("scheduler: run %s %s", runID, status)
+	return s.store.FinishRun(ctx, runID, status)
+}
+
+// abandon is the last resort when the scheduler itself cannot make progress,
+// e.g. the database is unreachable: log, and try to fail the run rather than
+// leave it running with nothing driving it.
+func (s *Scheduler) abandon(ctx context.Context, runID string, cause error) {
+	log.Printf("scheduler: run %s: %v", runID, cause)
+	if err := s.store.FinishRun(ctx, runID, RunFailed); err != nil {
+		log.Printf("scheduler: could not fail run %s: %v", runID, err)
+	}
+}
+
+// readyByPriority returns the pending steps whose dependencies have all
+// completed, most urgent first.
+//
+// Urgency is the length of the longest chain of steps still to come after this
+// one. When two ready steps want the same device, the one on the longer chain
+// goes first: in the default workflow, filling the reagent plate before the
+// buffer plate lets the warm-up overlap with the buffer fill, which is the
+// difference between a 10s run and a 12s one.
+func readyByPriority(steps []Step, status map[string]string) []Step {
+	var ready []Step
+	for _, st := range steps {
+		if st.Status == StepPending && depsCompleted(st, status) {
+			ready = append(ready, st)
+		}
+	}
+	if len(ready) < 2 {
+		return ready
+	}
+
+	chain := chainLengths(steps)
+	sort.SliceStable(ready, func(i, j int) bool {
+		return chain[ready[i].Name] > chain[ready[j].Name]
+	})
+	return ready
+}
+
+func depsCompleted(st Step, status map[string]string) bool {
+	for _, dep := range st.DependsOn {
+		if status[dep] != StepCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+// chainLengths maps each step to the number of steps on the longest path from
+// it to the end of the workflow, itself included. Steps are assumed to take
+// equal time. The workflow loader has already rejected cycles.
+func chainLengths(steps []Step) map[string]int {
+	dependents := make(map[string][]string, len(steps))
+	for _, st := range steps {
+		for _, dep := range st.DependsOn {
+			dependents[dep] = append(dependents[dep], st.Name)
+		}
+	}
+
+	length := make(map[string]int, len(steps))
+	var walk func(name string) int
+	walk = func(name string) int {
+		if n, ok := length[name]; ok {
+			return n
+		}
+		longest := 0
+		for _, next := range dependents[name] {
+			longest = max(longest, walk(next))
+		}
+		length[name] = longest + 1
+		return length[name]
+	}
+	for _, st := range steps {
+		walk(st.Name)
+	}
+	return length
 }

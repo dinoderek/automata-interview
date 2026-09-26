@@ -16,8 +16,8 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | Round | Scope | Gates |
 |---|---|---|
 | 0 | git, diary, gates script, driver-interaction analysis | static |
-| 1 | Rungs 1–3: execute DAG, overlap, cope with refusal | static, test, live |
-| 2 | Rung 4: failing steps, late results, send errors | + failure |
+| 1 | Rungs 1–4 floor: execute DAG, overlap, refusal, fail hard on any driver error | static, test, live, failure |
+| 2 | Tests for the unhappy paths (fake bus: refusal, send error, failed/late result) | + failure |
 | 3 | Going further: bounded retries *or* dropped-result detection | + manual fault runs |
 | 4 | NOTES.md, drafted from this diary | — |
 
@@ -68,5 +68,66 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 - test: runs against Postgres and fails as expected — the stub scheduler
   leaves every step `pending`. This is the baseline round 1 must turn green.
 - live / failure: not run (nothing to check yet).
+
+**Time:** ~
+
+---
+
+## Round 1 — the scheduler, floor rungs 1–4
+
+**Done**
+- `scheduler.go`: `Start` and `HandleResult` take the mutex, record what
+  happened, then call `advance`, which rescans the run: fail it if any step
+  failed, complete it if all completed, otherwise dispatch every ready step
+  whose device is free.
+- `store.go`: every transition is conditional on the current status —
+  `StartRun` (pending→running, else `ErrRunNotPending`), `FinishRun` (only a
+  running run), `RecordStepRunning` (pending→running, stamps `dispatched_at`),
+  `RecordStepFinished` (running→completed/failed, scoped to the run, reports
+  whether it applied), `RecordDispatchFailed` (pending→failed).
+  `RecordStepDispatched` replaced by `RecordStepRunning`.
+- `scheduler_test.go`: pure unit tests for readiness and priority.
+- `gates.sh live` now starts the whole stack — the drivers are not
+  dependencies of the executor in compose, so `up executor` left them down.
+
+**Decisions**
+- *Critical-path priority.* Among ready steps, prefer the one with the longest
+  chain of steps still to come. In the default workflow the two liquid-handler
+  fills become ready together; name order picks `fill_buffer_plate` and the
+  run takes 12s, critical-path order picks `fill_reagent_plate` so its warm-up
+  overlaps the buffer fill: 10s, the optimum. Assumes equal step durations;
+  recomputed each scan (O(steps + deps)).
+- *Rung 4 floor pulled into this round.* "Fail hard on any driver error" is a
+  few lines once the rescan exists: a failed result marks the step failed and
+  the next rescan fails the run. Deviation from the round plan, noted here.
+- *Refusal despite our records saying the device is free* → log, leave
+  pending, reconsider on the next result. Should not happen with one run.
+- *Any `SendCommand` error* (including `ErrNoResponders`) → step `failed`
+  with "dispatch failed, outcome unknown", run `failed`.
+- *Scheduler cannot make progress* (DB error mid-handle, or a driver accepted
+  but we could not record it) → `abandon`: log and try to fail the run so it
+  does not sit `running` with nothing driving it.
+
+**Gates**
+- static: pass. Unit tests: pass.
+- test (`go test -race`, simultaneous results): pass — was failing in round 0.
+- live: all 5 checks pass on both workflows. Default 10s, Triple Assay 6s
+  (both optimal), 0 refusals.
+- failure: pass — run ends `failed`; `fill_buffer_plate` was mid-flight on
+  the liquid handler and its late result was recorded `completed` afterwards
+  with nothing new dispatched.
+
+**Known gaps (for later rounds / NOTES.md)**
+- A refused step is only retried on the next result. If no result is coming
+  (dropped result, or the device busy with someone else's work) the run
+  stalls.
+- Steps that never ran stay `pending` on a failed run — indistinguishable from
+  waiting. Nothing records which step stopped the run beyond its `error`.
+- The mutex serialises all runs; per-result cost is a full read of the run's
+  steps plus a DB round trip per dispatch, all under the lock.
+- No crash recovery: a restart forgets nothing (state is in Postgres) but
+  nothing resumes a `running` run.
+- The unhappy paths (refusal, send error, late result) are covered only by
+  manual runs, not tests.
 
 **Time:** ~
