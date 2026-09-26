@@ -30,11 +30,12 @@ type Store struct {
 
 func NewStore(db *sql.DB) *Store { return &Store{db: db} }
 
-const runCols = `id, workflow_name, status, created_at, started_at, finished_at`
+const runCols = `id, workflow_name, status, failed_step, error, created_at, started_at, finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
-	err := row.Scan(&r.ID, &r.WorkflowName, &r.Status, &r.CreatedAt, &r.StartedAt, &r.FinishedAt)
+	err := row.Scan(&r.ID, &r.WorkflowName, &r.Status, &r.FailedStep, &r.Error,
+		&r.CreatedAt, &r.StartedAt, &r.FinishedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -162,11 +163,27 @@ func (s *Store) StartRun(ctx context.Context, id string) error {
 	return requireOneRow(res, ErrRunNotPending)
 }
 
-// FinishRun ends a running run. A run that has already ended is left alone.
-func (s *Store) FinishRun(ctx context.Context, id, status string) error {
+// FinishRun ends a run that is in status from: running -> completed, or
+// failed_draining -> failed. A run in any other status is left alone.
+func (s *Store) FinishRun(ctx context.Context, id, from, to string) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE runs SET status = $1, finished_at = now(), updated_at = now()
-		 WHERE id = $2 AND status = $3`, status, id, RunRunning)
+		 WHERE id = $2 AND status = $3`, to, id, from)
+	return err
+}
+
+// FailRun records the failure that stopped a running run: the step that
+// failed (empty if the scheduler itself failed) and why. status is failed, or
+// failed_draining if steps are still on instruments, in which case finished_at
+// is left for FinishRun. Only a running run is changed, so the first failure
+// is the one kept.
+func (s *Store) FailRun(ctx context.Context, id, status, stepName, reason string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE runs
+		    SET status = $1, failed_step = $2, error = $3, updated_at = now(),
+		        finished_at = CASE WHEN $1 = $4 THEN now() END
+		  WHERE id = $5 AND status = $6`,
+		status, nullable(stepName), nullable(reason), RunFailed, id, RunRunning)
 	return err
 }
 

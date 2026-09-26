@@ -21,7 +21,9 @@ import (
 //   - A device is busy if one of our steps is running on it. We do not send it
 //     more work until that step's result arrives.
 //   - Any driver error fails the run: a result with an error, or a command that
-//     could not be delivered or answered.
+//     could not be delivered or answered. The run records the first failed step
+//     and its reason. If steps are still on instruments, which cannot be
+//     cancelled, the run is failed_draining until they report, then failed.
 type Scheduler struct {
 	store *Store
 	bus   Bus
@@ -83,8 +85,8 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	if run.Status != RunRunning {
-		return nil // already ended; late results are recorded but move nothing
+	if run.Status != RunRunning && run.Status != RunFailedDraining {
+		return nil // over; a late result is recorded but moves nothing
 	}
 
 	steps, err := s.store.ListSteps(ctx, runID)
@@ -93,9 +95,10 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 	}
 
 	status := make(map[string]string, len(steps))
-	busy := make(map[string]bool)
+	busy := make(map[string]bool) // devices with one of our steps on them
 	completed := 0
-	for _, st := range steps {
+	var failed *Step
+	for i, st := range steps {
 		status[st.Name] = st.Status
 		switch st.Status {
 		case StepRunning:
@@ -103,11 +106,29 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 		case StepCompleted:
 			completed++
 		case StepFailed:
-			return s.finish(ctx, runID, RunFailed)
+			if failed == nil {
+				failed = &steps[i]
+			}
 		}
 	}
+
+	if run.Status == RunFailedDraining {
+		if len(busy) == 0 {
+			log.Printf("scheduler: run %s drained, now failed", runID)
+			return s.store.FinishRun(ctx, runID, RunFailedDraining, RunFailed)
+		}
+		return nil
+	}
+	if failed != nil {
+		reason := ""
+		if failed.Error != nil {
+			reason = *failed.Error
+		}
+		return s.fail(ctx, runID, failed.Name, reason, len(busy))
+	}
 	if completed == len(steps) {
-		return s.finish(ctx, runID, RunCompleted)
+		log.Printf("scheduler: run %s completed", runID)
+		return s.store.FinishRun(ctx, runID, RunRunning, RunCompleted)
 	}
 
 	for _, st := range readyByPriority(steps, status) {
@@ -124,8 +145,7 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 			if rerr := s.store.RecordDispatchFailed(ctx, st.ID, msg); rerr != nil {
 				log.Printf("scheduler: record dispatch failure for %s: %v", st.Name, rerr)
 			}
-			log.Printf("scheduler: %s", msg)
-			return s.finish(ctx, runID, RunFailed)
+			return s.fail(ctx, runID, st.Name, msg, len(busy))
 		}
 		if !ack.Accepted {
 			// Our own records say the device is free, so something we do not
@@ -143,17 +163,25 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 	return nil
 }
 
-func (s *Scheduler) finish(ctx context.Context, runID, status string) error {
-	log.Printf("scheduler: run %s %s", runID, status)
-	return s.store.FinishRun(ctx, runID, status)
+// fail stops a running run because stepName failed. Nothing new is dispatched
+// from here on. With steps still on instruments the run drains first.
+func (s *Scheduler) fail(ctx context.Context, runID, stepName, reason string, inFlight int) error {
+	status := RunFailed
+	if inFlight > 0 {
+		status = RunFailedDraining
+	}
+	log.Printf("scheduler: run %s %s: %s: %s (%d step(s) still on instruments)",
+		runID, status, stepName, reason, inFlight)
+	return s.store.FailRun(ctx, runID, status, stepName, reason)
 }
 
 // abandon is the last resort when the scheduler itself cannot make progress,
 // e.g. the database is unreachable: log, and try to fail the run rather than
-// leave it running with nothing driving it.
+// leave it running with nothing driving it. No step is to blame, and whether
+// anything is still on an instrument is unknown, so it goes straight to failed.
 func (s *Scheduler) abandon(ctx context.Context, runID string, cause error) {
 	log.Printf("scheduler: run %s: %v", runID, cause)
-	if err := s.store.FinishRun(ctx, runID, RunFailed); err != nil {
+	if err := s.store.FailRun(ctx, runID, RunFailed, "", "scheduler error: "+cause.Error()); err != nil {
 		log.Printf("scheduler: could not fail run %s: %v", runID, err)
 	}
 }

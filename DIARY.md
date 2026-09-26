@@ -122,12 +122,71 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
   (dropped result, or the device busy with someone else's work) the run
   stalls.
 - Steps that never ran stay `pending` on a failed run — indistinguishable from
-  waiting. Nothing records which step stopped the run beyond its `error`.
+  waiting. ~~Nothing records which step stopped the run beyond its `error`.~~
+  (fixed in round 1.1)
 - The mutex serialises all runs; per-result cost is a full read of the run's
   steps plus a DB round trip per dispatch, all under the lock.
 - No crash recovery: a restart forgets nothing (state is in Postgres) but
   nothing resumes a `running` run.
 - The unhappy paths (refusal, send error, late result) are covered only by
   manual runs, not tests.
+
+**Time:** ~
+
+---
+
+## Round 1.1 — failure bookkeeping: draining, and why the run failed
+
+Prompted by walking through a `check-failure.sh` run: the incubator failed at
+~4.0s while the liquid handler had just been sent `fill_buffer_plate`. The run
+said `failed` at 4.03s, but the liquid handler kept dispensing until 6.03s, and
+nothing on the run said which step had stopped it.
+
+**Done**
+- New run status `failed_draining`: a step failed, nothing new is dispatched,
+  but steps already on instruments have not reported. Instruments cannot be
+  cancelled, so the run is not over until they do. When the last one reports,
+  the run becomes `failed` and only then gets `finished_at`. With nothing in
+  flight at the moment of failure, the run goes straight to `failed`.
+- `runs.failed_step` and `runs.error`: the first failure that stopped the run
+  (step name + the step's error). Steps keep their own `error` as before; a
+  step that fails while the run drains records its error, the run keeps the
+  first.
+- Store: `FailRun` (running → failed / failed_draining, with reason; only from
+  running, so the first failure wins) and `FinishRun(from, to)` (running →
+  completed, failed_draining → failed).
+- `abandon` (scheduler's own error) records `failed_step = NULL`,
+  `error = "scheduler error: …"`.
+
+**Decisions**
+- "Pending work" for draining means steps *running on instruments*, not
+  `pending` steps — those will never start.
+- A dropped result for a draining step leaves the run `failed_draining`
+  forever. Accepted for now: we genuinely do not know what that instrument
+  did. Round 3 (drop detection) would resolve it.
+- Schema changed in `db/init.sql`, which only runs on an empty volume. The
+  local `postgres_data` volume was recreated (it held only runs created by our
+  own gates). Anyone with an existing volume needs `docker compose down -v`.
+
+- `scheduler_failure_test.go`: our own DB-backed tests, playing the drivers
+  step by step with the `recordingBus` from the concurrency test. The workflow
+  shape is fixed in the test, not read from `workflows.yaml`. Covers:
+  drain then fail; a second failure while draining keeps the first as the
+  run's reason; failure with nothing in flight fails immediately; a duplicate
+  result after the run ended is ignored. Also asserts nothing new is
+  dispatched once the run has failed (`warm_reagent_plate` stays pending).
+  Checked by breaking draining on purpose: the three draining tests fail.
+
+**Gates**
+- static, unit tests, `go test -race` (8 tests): pass.
+- live: 5/5 on both workflows, 10s and 6s, 0 refusals.
+- failure: pass (6s now, was 4s — the run waits for the in-flight liquid
+  handler step). A polled manual run shows the transition:
+  ```
+   0.03s  running          running=fill_sample_plate
+   2.23s  running          running=fill_reagent_plate,incubate_samples
+   4.19s  failed_draining  failed_step=incubate_samples  running=fill_buffer_plate
+   6.15s  failed           failed_step=incubate_samples
+  ```
 
 **Time:** ~

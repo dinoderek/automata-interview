@@ -15,11 +15,16 @@ CREATE TABLE devices (
 );
 
 -- A run is one execution of a workflow.
--- status: pending | running | completed | failed | aborted
+-- status: pending | running | completed | failed_draining | failed | aborted
+--   failed_draining: a step failed, nothing new will be dispatched, but steps
+--   already on instruments are still running. Becomes failed when they report.
+-- failed_step / error: the first failure that stopped the run.
 CREATE TABLE runs (
     id            TEXT PRIMARY KEY,
     workflow_name TEXT        NOT NULL,
     status        TEXT        NOT NULL DEFAULT 'pending',
+    failed_step   TEXT,
+    error         TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at    TIMESTAMPTZ,
     finished_at   TIMESTAMPTZ,

@@ -8,6 +8,11 @@ const (
 	RunCompleted = "completed"
 	RunFailed    = "failed"
 	RunAborted   = "aborted"
+
+	// RunFailedDraining: a step failed and nothing new will be dispatched, but
+	// steps already on instruments have not reported yet. Instruments cannot be
+	// cancelled, so the run is not over until they do.
+	RunFailedDraining = "failed_draining"
 )
 
 const (
@@ -28,6 +33,8 @@ type Run struct {
 	ID           string     `json:"id"`
 	WorkflowName string     `json:"workflow_name"`
 	Status       string     `json:"status"`
+	FailedStep   *string    `json:"failed_step,omitempty"`
+	Error        *string    `json:"error,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	StartedAt    *time.Time `json:"started_at"`
 	FinishedAt   *time.Time `json:"finished_at"`
