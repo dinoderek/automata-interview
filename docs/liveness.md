@@ -31,10 +31,11 @@ Qualifications:
 > **A (assumption).** Every step in `running` eventually yields exactly one
 > result, which is delivered to `HandleResult` and recorded.
 
-> **V (variant).** Each recorded result moves one dispatch attempt of one step
-> to a terminal state. The number of attempts is bounded (one per step today;
-> `maxAttempts` per step once retries exist), so only finitely many results
-> can ever be recorded.
+> **V (variant).** Each recorded result ends one dispatch attempt of one step.
+> Attempts are bounded by `maxAttempts` per step (retries, round 3), so only
+> finitely many results can ever be recorded. Refusals do not consume
+> attempts, but cannot loop either: a refused step either waits for a result
+> already in flight (bounded, by the above) or fails the run (round 2.5).
 
 **Argument.** By V, results eventually stop arriving. By A, at that point no
 step is `running` — every one has reported. By I, a run with no step

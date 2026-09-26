@@ -219,6 +219,27 @@ func (s *Store) RecordStepFinished(ctx context.Context, runID, stepID, status, e
 	return n == 1, err
 }
 
+// GetStep returns one step of a run.
+func (s *Store) GetStep(ctx context.Context, runID, stepID string) (*Step, error) {
+	return scanStep(s.db.QueryRowContext(ctx,
+		`SELECT `+stepCols+` FROM steps WHERE id = $1 AND run_id = $2`, stepID, runID))
+}
+
+// RecordStepRetrying puts a running step whose attempt failed back to pending,
+// keeping the failure in error, so it is dispatched again. finished_at stays
+// unset: the step is not finished. Reports false if the step was not running.
+func (s *Store) RecordStepRetrying(ctx context.Context, runID, stepID, errMsg string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE steps SET status = $1, error = $2, updated_at = now()
+		 WHERE id = $3 AND run_id = $4 AND status = $5`,
+		StepPending, nullable(errMsg), stepID, runID, StepRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // RecordDispatchFailed fails a pending step whose command could not be
 // delivered or answered. The driver may or may not have taken it.
 func (s *Store) RecordDispatchFailed(ctx context.Context, stepID, errMsg string) error {

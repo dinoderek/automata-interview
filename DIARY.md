@@ -20,7 +20,7 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | 1.1 | `failed_draining`, failure reasons on run and step, draining tests | all |
 | 2 | Tests for refusal and send errors (scripted bus); liveness analysis | all |
 | 2.5 | Liveness: fail a run that ends a scan with nothing in flight | all |
-| 3 | Going further: bounded retries of retryable failures | + manual fault runs |
+| 3 | Going further: bounded retries of retryable failures | all + manual fault runs |
 | 4 | NOTES.md, drafted from this diary | — |
 
 ---
@@ -277,5 +277,63 @@ nothing on the run said which step had stopped it.
 - Live re-run of the two-runs reproduction: the second run now ends `failed`,
   `failed_step=fill_sample_plate`, `error=refused by liquid-handler-1 (busy
   with fill_sample_plate) with nothing in flight to wait for`.
+
+**Time:** ~
+
+---
+
+## Round 3 — bounded retries
+
+**Done**
+- `HandleResult` → `record`: a failed result goes back to `pending` (and is
+  re-dispatched by the same scan) when all hold: the driver says
+  `retryable`, the run is still `running`, and the step has attempts left
+  (`dispatch_count < maxAttempts`, `maxAttempts = 3`). Otherwise the step
+  fails and its error says why it was not retried:
+  - `<err> (attempt 1 of 3, retrying)` — while retrying
+  - `<err> (attempt 3 of 3, giving up)` — bound reached
+  - `<err> (retryable, not retried: run is failed_draining)`
+  - non-retryable errors are recorded as reported.
+- Store: `GetStep`, `RecordStepRetrying` (running → pending, keeps the error,
+  leaves `finished_at` unset).
+- Harness: `finish` now reports non-retryable failures (as the liquid
+  handler does); `finishRetryable` for the others. The existing draining
+  tests keep testing what they tested.
+- `scheduler_retry_test.go`: retried and recovers; a retried step keeps its
+  priority (fill_reagent_plate wins the liquid handler back from
+  fill_buffer_plate); gives up after 3 and fails the run (draining); no retry
+  while draining; a refused retry with nothing in flight fails the run.
+  Checked by breaking the bound and the draining guard: each is caught.
+
+**Decisions**
+- *No new status.* A retrying step is `pending` with the last error kept, and
+  immediately `running` again; `dispatch_count` is the attempt counter. On
+  eventual success `error` is cleared, so the history survives only as
+  `dispatch_count` > 1 — a choice; a step-attempts table would keep it.
+- *Fixed `maxAttempts = 3`*, not per step. Per-step `max_attempts` in the
+  workflow YAML would be the natural next step.
+- *Retry immediately, no backoff.* The driver freed itself before reporting,
+  so the device is available. For real instruments a failure often needs a
+  human (jammed lid), and backoff or an operator gate would be better.
+- *Only the driver's `retryable` flag grants a retry.* The liquid handler
+  says `false` (part-dispensed plate). Send errors are never retried: the
+  step may be executing.
+- *Retrying deliberately breaks "every step runs exactly once"* for steps
+  whose instrument said a repeat is safe. The acceptance script's
+  duplicate-execution check flags them (see below).
+- *A retry holds its device.* The retry goes out in the same scan the
+  failure is recorded, so it keeps the device ahead of other ready steps of
+  equal or lower priority. In the check-failure run, warm_reagent_plate never
+  got the incubator while incubate_samples used its three attempts.
+
+**Gates**
+- all pass: static, `go test -race` (18 tests + 2 subtests), live 5/5 on
+  both workflows (10s / 6s, 0 refusals), failure pass — now 8s:
+  `incubate_samples` ran 3 times, run `failed` with
+  `instrument error during incubate_samples (attempt 3 of 3, giving up)`.
+- Manual, `INC_FAIL_PCT=50`, 4 acceptance runs: all 4 `completed` (13–15s)
+  where each would have failed without retries. Each is flagged by check 5
+  ("steps executed more than once") for the retried incubator step — the
+  intended trade-off.
 
 **Time:** ~

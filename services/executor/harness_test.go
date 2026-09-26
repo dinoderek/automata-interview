@@ -64,18 +64,31 @@ func newRunHarness(t *testing.T, script map[string][]reply) *runHarness {
 	return h
 }
 
-// finish reports the named step finished, with errMsg set if it failed. The
-// step must have been accepted by a driver.
+// finish reports the named step finished, with errMsg set if it failed. A
+// failure is reported as not retryable, like the liquid handler's. The step
+// must have been accepted by a driver.
 func (h *runHarness) finish(name, errMsg string) {
+	h.t.Helper()
+	h.report(name, errMsg, false)
+}
+
+// finishRetryable reports the named step failed, and that the driver considers
+// it safe to run again, like the incubator's and plate reader's failures.
+func (h *runHarness) finishRetryable(name, errMsg string) {
+	h.t.Helper()
+	h.report(name, errMsg, true)
+}
+
+func (h *runHarness) report(name, errMsg string, retryable bool) {
 	h.t.Helper()
 	for _, c := range h.bus.sent() {
 		if c.StepName == name {
 			h.sched.HandleResult(h.ctx, StepResult{RunID: c.RunID, StepID: c.StepID,
-				StepName: c.StepName, DeviceID: c.DeviceID, Error: errMsg, Retryable: errMsg != ""})
+				StepName: c.StepName, DeviceID: c.DeviceID, Error: errMsg, Retryable: retryable})
 			return
 		}
 	}
-	h.t.Fatalf("finish %s: it was never dispatched (sent: %v)", name, h.sentNames())
+	h.t.Fatalf("report %s: it was never dispatched (sent: %v)", name, h.sentNames())
 }
 
 func (h *runHarness) sentNames() []string {

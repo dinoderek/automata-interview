@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"sync"
 )
+
+// maxAttempts bounds how many times a step is run when its driver keeps
+// reporting retryable failures. A retry that never gives up is a hang.
+const maxAttempts = 3
 
 // Scheduler owns the question "what should be running right now, and on what?".
 //
@@ -24,6 +30,8 @@ import (
 //     could not be delivered or answered. The run records the first failed step
 //     and its reason. If steps are still on instruments, which cannot be
 //     cancelled, the run is failed_draining until they report, then failed.
+//   - Except: a failed step the driver calls retryable is sent again, up to
+//     maxAttempts in all, while the run is still running.
 type Scheduler struct {
 	store *Store
 	bus   Bus
@@ -56,11 +64,7 @@ func (s *Scheduler) HandleResult(ctx context.Context, res StepResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	status := StepCompleted
-	if res.Error != "" {
-		status = StepFailed
-	}
-	recorded, err := s.store.RecordStepFinished(ctx, res.RunID, res.StepID, status, res.Error)
+	recorded, status, err := s.record(ctx, res)
 	if err != nil {
 		s.abandon(ctx, res.RunID, fmt.Errorf("record result for %s: %w", res.StepName, err))
 		return
@@ -75,6 +79,47 @@ func (s *Scheduler) HandleResult(ctx context.Context, res StepResult) {
 	if err := s.advance(ctx, res.RunID); err != nil {
 		s.abandon(ctx, res.RunID, err)
 	}
+}
+
+// record applies a result to its step, and reports whether it applied (the
+// step was running in that run) and what the step became.
+//
+// A failed attempt goes back to pending, to be dispatched again by the next
+// scan, if the driver says the step can be repeated, the run is still running,
+// and the step has attempts left. Otherwise the step fails, and its error says
+// why it was not retried.
+func (s *Scheduler) record(ctx context.Context, res StepResult) (bool, string, error) {
+	if res.Error == "" {
+		ok, err := s.store.RecordStepFinished(ctx, res.RunID, res.StepID, StepCompleted, "")
+		return ok, StepCompleted, err
+	}
+
+	msg := res.Error
+	if res.Retryable {
+		step, err := s.store.GetStep(ctx, res.RunID, res.StepID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", nil // not a step of this run
+		}
+		if err != nil {
+			return false, "", err
+		}
+		run, err := s.store.GetRun(ctx, res.RunID)
+		if err != nil {
+			return false, "", err
+		}
+		switch {
+		case run.Status != RunRunning:
+			msg = fmt.Sprintf("%s (retryable, not retried: run is %s)", res.Error, run.Status)
+		case step.DispatchCount >= maxAttempts:
+			msg = fmt.Sprintf("%s (attempt %d of %d, giving up)", res.Error, step.DispatchCount, maxAttempts)
+		default:
+			msg = fmt.Sprintf("%s (attempt %d of %d, retrying)", res.Error, step.DispatchCount, maxAttempts)
+			ok, err := s.store.RecordStepRetrying(ctx, res.RunID, res.StepID, msg)
+			return ok, "retrying", err
+		}
+	}
+	ok, err := s.store.RecordStepFinished(ctx, res.RunID, res.StepID, StepFailed, msg)
+	return ok, StepFailed, err
 }
 
 // advance looks at the whole run and does whatever is due: finish the run if
