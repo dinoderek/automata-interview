@@ -22,6 +22,7 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | 2.5 | Liveness: fail a run that ends a scan with nothing in flight | all |
 | 3 | Going further: bounded retries of retryable failures | all + manual fault runs |
 | 4 | Going further: lost results (DROP) — reconcile loop, fail fast | all + manual drop run |
+| 5 | One run at a time, enforced at `Start` | all + live two-start check |
 | 4 | NOTES.md, drafted from this diary | — |
 
 ---
@@ -420,5 +421,50 @@ Design discussed first, recorded in `docs/drops.md`.
 - Manual, `INC_DROP_PCT=100`: run failed at 6.98s with `result lost:
   incubator-1 finished incubate_samples (attempt 1) but never reported;
   outcome unknown` (incubator finished at ~4s); previously hung for ever.
+
+**Time:** ~
+
+---
+
+## Round 5 — one run at a time, enforced
+
+**Done**
+- `StartRun` starts a run only if no other run is active (`running` or
+  `failed_draining` — a draining run still has steps on instruments). One
+  conditional `UPDATE … AND NOT EXISTS (…)`; if it does not apply, it says
+  why: `ErrRunNotPending`, or `ErrAnotherRunActive: <active run id>`.
+- `POST /runs/{id}/start` answers **409** for both (was 500).
+- Harness: `createTestRun` aborts its run at cleanup if still active — tests
+  leave runs active on purpose, which would now block the next test.
+- `scheduler_start_test.go`: refused while another run is running (stays
+  pending, nothing sent); refused while another is draining, starts once it
+  has drained; a second start of the same run is "not pending". Checked by
+  removing the `NOT EXISTS`: both clash tests fail.
+
+**Decisions**
+- *Enforced in the app, under the scheduler mutex.* READ COMMITTED does not
+  make the check-and-update safe against a concurrent start by itself; the
+  mutex serialises starts in this process. Across executor processes, a
+  partial unique index on active runs would enforce it in the database.
+- *Draining counts as active*: the instruments are still in use.
+
+**Found along the way**
+- Two runs in the local DB would have blocked every start for ever:
+  `run-1b0258492cc7` (the round 2 two-run reproduction: `running`, all steps
+  pending) and `run-b6b3d61a5981` (left `failed_draining` by a round 2
+  mutation check). Nothing could finish either — nothing in flight, and the
+  reconciler only looks at running steps. Marked `aborted` by hand.
+- Consequence: a stuck run now blocks the whole system, not just itself. No
+  abort endpoint exists (`aborted` is in the schema, unused).
+- Acceptance reported 11s once; the run's recorded duration was 10.05s. The
+  script polls once a second and counts whole seconds.
+
+**Gates**
+- all pass: static, `go test -race` (31 tests + 2 subtests), live 5/5 on
+  both workflows (10.05s recorded / 6s), failure pass. Tests leave no active
+  runs behind.
+- Live: two runs started back to back → A `200`, B `409 {"error":"another run
+  is active: run-514c550699dc"}`, B stays pending; after A completed, B
+  started (`200`) and completed.
 
 **Time:** ~

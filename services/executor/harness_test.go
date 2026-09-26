@@ -54,16 +54,13 @@ func newRunHarness(t *testing.T, script map[string][]reply) *runHarness {
 
 	ctx := context.Background()
 	store := NewStore(db)
-	run, err := store.CreateRun(ctx, t.Name(), pcrTemplate)
-	if err != nil {
-		t.Fatalf("create run: %v", err)
-	}
+	runID := createTestRun(t, store)
 	bus := &scriptedBus{script: script}
 	h := &runHarness{t: t, ctx: ctx, store: store, bus: bus,
-		sched: NewScheduler(store, bus), runID: run.ID,
+		sched: NewScheduler(store, bus), runID: runID,
 		clock: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	h.sched.now = func() time.Time { return h.clock }
-	if err := h.sched.Start(ctx, run.ID); err != nil {
+	if err := h.sched.Start(ctx, runID); err != nil {
 		t.Fatalf("start run: %v", err)
 	}
 	return h
@@ -291,3 +288,23 @@ func (h *runHarness) inFlight() []Step {
 }
 
 var errUnreachable = errors.New("state of device: nats: timeout")
+
+// createTestRun creates a pending run of pcrTemplate. Tests leave runs active
+// on purpose (a step left running, a run left draining); with one run at a
+// time that would block the next test, so the run is aborted at cleanup.
+func createTestRun(t *testing.T, store *Store) string {
+	t.Helper()
+	ctx := context.Background()
+	run, err := store.CreateRun(ctx, t.Name(), pcrTemplate)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE runs SET status = $1, finished_at = now() WHERE id = $2 AND status IN ($3, $4)`,
+			RunAborted, run.ID, RunRunning, RunFailedDraining); err != nil {
+			t.Errorf("abort run %s: %v", run.ID, err)
+		}
+	})
+	return run.ID
+}

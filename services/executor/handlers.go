@@ -163,7 +163,11 @@ func (h *Handlers) startRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.sched.Start(r.Context(), id); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		code := http.StatusInternalServerError
+		if errors.Is(err, ErrRunNotPending) || errors.Is(err, ErrAnotherRunActive) {
+			code = http.StatusConflict
+		}
+		writeError(w, code, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "run started", "run_id": id})

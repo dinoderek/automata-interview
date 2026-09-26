@@ -14,6 +14,10 @@ import (
 var (
 	ErrRunNotFound   = errors.New("run not found")
 	ErrRunNotPending = errors.New("run is not pending")
+
+	// ErrAnotherRunActive: one run at a time. A run is active while it is
+	// running or failed_draining (steps still on instruments).
+	ErrAnotherRunActive = errors.New("another run is active")
 )
 
 func newID(prefix string) string {
@@ -151,16 +155,42 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]Step, error) {
 	return out, rows.Err()
 }
 
-// StartRun moves a run from pending to running. It returns ErrRunNotPending if
-// the run was already started, so a run is only ever scheduled from scratch once.
+// StartRun moves a run from pending to running, provided no other run is
+// active: one run at a time. Otherwise it changes nothing and returns
+// ErrRunNotPending, or ErrAnotherRunActive naming the active run.
+//
+// The check and the update are one statement, but READ COMMITTED does not
+// make it safe against a concurrent StartRun on its own; the scheduler's mutex
+// serialises starts. (Across executor processes, a partial unique index on
+// active runs would enforce it in the database.)
 func (s *Store) StartRun(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE runs SET status = $1, started_at = now(), updated_at = now()
-		 WHERE id = $2 AND status = $3`, RunRunning, id, RunPending)
+		 WHERE id = $2 AND status = $3
+		   AND NOT EXISTS (SELECT 1 FROM runs WHERE status IN ($1, $4))`,
+		RunRunning, id, RunPending, RunFailedDraining)
 	if err != nil {
 		return err
 	}
-	return requireOneRow(res, ErrRunNotPending)
+	if n, err := res.RowsAffected(); err != nil || n == 1 {
+		return err
+	}
+
+	// Not started: say why.
+	run, err := s.GetRun(ctx, id)
+	if err != nil {
+		return err
+	}
+	if run.Status != RunPending {
+		return ErrRunNotPending
+	}
+	var active string
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM runs WHERE status IN ($1, $2) LIMIT 1`,
+		RunRunning, RunFailedDraining).Scan(&active); err != nil {
+		return fmt.Errorf("start refused, but finding the active run failed: %w", err)
+	}
+	return fmt.Errorf("%w: %s", ErrAnotherRunActive, active)
 }
 
 // FinishRun ends a run that is in status from: running -> completed, or

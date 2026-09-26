@@ -78,7 +78,8 @@ Our own steps never cause it: a driver frees itself *before* publishing its
 result, so our records are always the more conservative. The foreign work
 can be:
 
-- **Another run.** "One run at a time" is an assumption, not enforced.
+- **Another run.** "One run at a time" was an assumption, not enforced
+  (enforced since round 5, see below).
   Reproduced on the live stack by starting two runs back to back:
 
   ```
@@ -143,7 +144,18 @@ of wake-ups that does not depend on a driver reporting.
 | Gap | Status |
 |---|---|
 | §1 refusal stall | handled — run fails immediately; timer (full R1) deferred to drop handling |
-| §1 two concurrent runs | handled the same way — the second run fails with the refusal as its reason. R2 not planned: one run at a time is an assumption of this exercise |
+| §1 two concurrent runs | prevented (round 5, R2): `Start` refuses with 409 while another run is `running` or `failed_draining` |
 | §2 abandon cannot persist | accepted — needs the database back; R4 would recover |
 | A: drops | handled — reconcile loop (R3's check, R4's trigger), fail fast; see drops.md |
 | A: restarts, lost results | accepted — R4 not planned; described in NOTES.md |
+
+## Consequence of enforcing one run at a time
+
+A run that never reaches a terminal status now blocks **every** later start,
+not just itself. Two such runs were found in the local database when the rule
+went in — both left over from before the fixes above (one `running` with
+every step pending, one `failed_draining` with nothing in flight) — and were
+marked `aborted` by hand. Anything that leaves a run non-terminal (a driver
+that stays unreachable, an executor that exited, §2) now needs an operator.
+There is no abort endpoint yet; `aborted` exists in the schema but nothing
+sets it.

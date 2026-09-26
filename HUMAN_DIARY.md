@@ -2,7 +2,7 @@
 
 * One workflow running per executor
 * Does not handle gracefully executor crashes, restarts with pending runs or busy drivers
-* Fail fast when environemnt does not match expectations
+* Fail fast when environemnt does not match expectations (one exception is device unexpected busy)
 * Fail fast on database errors
 
 
@@ -35,3 +35,7 @@ OK with limitations (no retry logs, no wait before retry, retries not configurab
 Devices are quite limited as designed - in particular it is not possible to know the outcome of the last operation (success/failure). Given this the best we can do is to determine whether the Step is still running on the device and if it is not we fail. I'm not sure this was aligned with the README, where it says "the device does its job". 
 
 Did some refinement of the "system error" case, where we crash becu
+
+# Step 5 - One workflow only running
+
+Enforce the invariant above
