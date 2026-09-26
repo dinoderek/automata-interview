@@ -25,6 +25,7 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | 5 | One run at a time, enforced at `Start` | all + live two-start check |
 | 6 | Review fixes: abandon on draining, unreachable driver, startup sweep, skipped steps, docs | all |
 | 7 | Send commands outside the lock: `dispatched` claim is back; refusal fails fast | all + frozen-driver check |
+| 8 | Back to round 6 (send under the mutex) + fail-fast refusal | all + frozen-driver check |
 | last | NOTES.md, drafted from this diary | — |
 
 ---
@@ -592,5 +593,55 @@ skips claims being sent; and a refusal fails fast.
   handled and `fill_buffer_plate` sent (16:03:51). The run failed as
   `dispatch failed, outcome unknown: … context deadline exceeded`, drained,
   ended `failed`.
+
+**Time:** ~
+
+---
+
+## Round 8 — back to sending under the mutex; keep fail-fast refusal
+
+Question that prompted it: would queueing results and handling them one at a
+time make the code simpler? Answer: not by itself — `Start` and the
+reconciler change the same state, so all three would feed one loop, which is
+the mutex's guarantee again. The complexity of round 7 came from *not
+blocking on a driver while serialised*, not from the mutex. Comparing the
+two honestly:
+
+- Round 7's sends within one scan were sequential too; "commands to several
+  unblocked steps go out in parallel" was not a benefit we had.
+- Its real benefits — no stall behind a hung driver, shorter lock hold, a
+  path to a database lock across processes — only pay off at scale. Under
+  fail-fast and one run at a time, the gain is at most one ≤3s stall before
+  a run that fails anyway.
+- The double-send hazard it closed was already closed by round 6.
+- It cost ~90 lines of production code, a sixth step state, three
+  interleavings to test, and the "decide → send → record is atomic"
+  invariant.
+
+**Done**
+- Restored round 6's scheduler, store, reconciler, tests and docs.
+- Re-applied round 7's one real improvement: **a refusal fails the step and
+  the run** (like a send error; the run drains if something is in flight).
+  Round 6's refusal machinery (`refused` map, `refusals` list, wait for the
+  next result) removed; the end-of-scan liveness check kept as a guard.
+- Tests: `TestRefusalFailsStepAndRun`, `TestRefusalWithWorkInFlightDrains`,
+  `TestOnlyReadyStepRefusedFailsRun`, `TestRetryRefusedFailsRun`; the
+  wait-for-next-result and refusal-plus-send-error tests dropped.
+- Docs: driver-interaction.md gains "Sending outside the lock: built in
+  round 7, reverted in round 8" with the measured comparison; liveness.md
+  and drops.md updated for fail-fast refusal.
+
+**Checks**
+- Deliberate breakages: refusal ignored → all four refusal tests fail;
+  occupancy ignored → several tests fail.
+- Live, incubator frozen: the liquid handler's result waited ~1s for the
+  lock (the hung send held it) until the 3s timeout; then the run failed as
+  `dispatch failed, outcome unknown` and drained. Round 7 handled that
+  result during the wait — the run failed either way.
+
+**Gates**
+- all pass: static, `go test -race` (33 tests), live 5/5 on both workflows
+  (10s; Triple Assay 6.14s recorded, the script printed 7s), 0 refusals,
+  failure pass.
 
 **Time:** ~

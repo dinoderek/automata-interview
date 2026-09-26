@@ -45,7 +45,6 @@ counts. So we can learn **that** a step finished on the instrument, never
 |---|---|
 | Result in transit when first seen idle (driver frees itself *before* publishing; our handler may be queued on the mutex) | `lostGrace`: first sighting only suspects; act only if still silent `lostGrace` later |
 | Result recorded between snapshot and lock | `RecordStepLost` requires `status = running` → no-op |
-| Command still in flight (step `dispatched`, driver not yet holding it — round 7) | in-memory set of claims being sent; the loop skips them |
 | Retry dispatched between snapshot and lock | `RecordStepLost` requires `dispatch_count = attempt`; suspicion is keyed by `(step, attempt)` so a retry starts fresh (`TestStaleSnapshotCannotFailNewAttempt`, `TestRetryStartsAFreshSuspicion`) |
 | Driver snapshot older than the step snapshot | steps are read first; a step read as running was already accepted |
 
@@ -70,8 +69,8 @@ in-flight work, not to run size or history. Idle system: one empty query.
   command to that driver failing at once.
 - **An instrument busy with our step for ever.** Believed indefinitely. A
   maximum duration per step would fail such a run (it cannot be cancelled).
-- **Refusals** fail the step (round 7) rather than being retried with
-  backoff, although the loop now provides the timer that would need.
+- **Refusals** fail the step and the run (round 8) rather than being retried
+  with backoff, although the loop now provides the timer that would need.
 - **Two runs and `CurrentStep`.** The driver reports the busy step by name;
   with two runs of the same workflow, "busy with fill_sample_plate" is
   ambiguous. Fine under one run at a time.

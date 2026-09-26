@@ -2,7 +2,19 @@
 
 ## How long
 
-Between 2h30 and 3h including the note and the reading + discussion before the first commit. 
+Around 3h including the note and the reading + discussion before the first commit and the last minute change I'm just doing.
+
+## What we built 
+
+- Basic scheduler
+- Retries of retryable failures, at most 3 attempts
+- Drop detection
+- Draining after failure
+- Failure reasons and skipped steps
+- Enforce one-run at a time
+- Ordering ready steps by critical path: the default workflow takes 10s instead of 12s
+- Failing runs left active at startup
+
 
 ## The questions
 
@@ -16,14 +28,14 @@ Between 2h30 and 3h including the note and the reading + discussion before the f
 ### Most likely to break
 
 - The issues above (multiple workflows, multiple executors, crash/restart)
-- One thing I did not investigate is whether there is pressure to respond to bus messages quickly
+- One thing I did not investigate is whether there is pressure to respond to bus messages quickly. With `SendCommand` inside the mutex, a driver that stops answering delays all result handling for up to the 3s command timeout.
 - The grace period of 1s in the reconciler is a guess
 - Database outage breaks us
 
 ### Concurrent drivers
 
 - Kept the bus's goroutine-per-result; every scheduling decision takes one global in-memory mutex. A serial bus alone would not be enough: `Start` and the reconcile loop change the same state, so the lock is needed anyway. Each handler rescans the whole run, so arrival order does not matter.
-- Two simultaneous results: the second handler waits for the lock and sees what the first committed. Steps are claimed (`dispatched`) before any command is sent, and every update is conditional on the current state, so no step is sent twice. The provided race test forces this.
+- Two simultaneous results: the second handler waits for the lock and sees what the first committed. The lock is held across decide → send → record, so nothing can see a step between being chosen and its outcome recorded, and every update is conditional on the current state, so no step is sent twice. The provided race test forces this.
 
 ### Drivers drop
 
@@ -35,24 +47,7 @@ Between 2h30 and 3h including the note and the reading + discussion before the f
 - Fail fast on database error
 - Does not support resume
 - Only "user" of the drivers. If a driver is busy when I expect ready then it's a failure. The brief calls a refusal "normal, not an error", but our own work can never cause one (we track device occupancy ourselves), so a refusal means something else holds the instrument.
-- The code is made quite a bit more complex by my decision to not do SendCommand within the mutex. 
-
-### What we built 
-
-We went beyond the four floor requirements: 
-
-- Retries of retryable failures, at most 3 attempts
-- Drop detection
-- Draining after failure
-- Failure reasons and skipped steps
-- Enforce one-run at a time
-- Ordering ready steps by critical path: the default workflow takes 10s instead of 12s
-- Failing runs left active at startup
-- SendCommand outside of mutex loop allows for higher concurrency / less wait time between steps
-
-### Something I would perhaps change
-
- Handling DROP and moving SendCommand our of the lock significanlty increased complexity - I would be more comfortable with more time to review the code and the architecture that what I had in this exercise. You can get a sense of the change of complexity by looking at the commit history. That said I felt DROP handling was one of the most interesting problems to address, I felt that adding a up to 3 second wait for a RPC in a mutex-holding loop were gaps that were too big to leave there and the testing coverage is good.
+- `SendCommand` is inside the mutex. I built sending outside it (round 7) and reverted it (round 8): it only removes a stall of at most 3s before a run that fails anyway, and the sends were not even parallel, while it cost a sixth step state and three races to test. It is the design to pick up at scale; see docs/driver-interaction.md.
 
 ### AI Conversation
 
