@@ -179,6 +179,10 @@ type scriptedBus struct {
 	attempts []string      // every command offered, by step name
 	accepted []StepCommand // commands a driver took
 	states   map[string]driverAnswer
+
+	// onSend, if set, runs inside SendCommand before it answers -- as things
+	// happen elsewhere while a real command is in flight. Set before use.
+	onSend func(StepCommand)
 }
 
 // driverAnswer is what DriverState returns for a device.
@@ -197,6 +201,11 @@ func (b *scriptedBus) SendCommand(ctx context.Context, cmd StepCommand) (Command
 	}
 	if r.err == nil && r.ack.Accepted {
 		b.accepted = append(b.accepted, cmd)
+	}
+	if b.onSend != nil {
+		b.mu.Unlock()
+		b.onSend(cmd)
+		b.mu.Lock()
 	}
 	return r.ack, r.err
 }

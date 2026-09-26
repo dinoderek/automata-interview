@@ -62,7 +62,8 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 	// Outside the lock: DriverState can take seconds, and results must not
 	// queue behind it. Our steps were read first, then the drivers: a step we
-	// read as running was already accepted, so no driver snapshot predates it.
+	// read as on an instrument was already claimed, so no driver snapshot
+	// predates it.
 	views := make(map[string]driverView)
 	for _, st := range inFlight {
 		if _, done := views[st.DeviceID]; done {
@@ -75,17 +76,27 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 		views[st.DeviceID] = driverView{ds, err}
 	}
 
+	s.send(ctx, s.judge(ctx, inFlight, views))
+}
+
+// judge acts, under the lock, on what reconcileSteps learned, and returns any
+// claims that follow.
+func (s *Scheduler) judge(ctx context.Context, inFlight []Step, views map[string]driverView) []claim {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
 	stillSuspected := make(map[attempt]bool)
+	var claims []claim
 	for _, st := range inFlight {
+		a := attempt{st.ID, st.DispatchCount}
+		if s.sending[a] {
+			continue // its command is still being sent; the driver may not have it yet
+		}
 		v := views[st.DeviceID]
 		if v.err == nil && v.state.Busy && v.state.CurrentStep == st.Name {
 			continue // still working on it
 		}
 
-		a := attempt{st.ID, st.DispatchCount}
 		stillSuspected[a] = true
 		first, seen := s.suspected[a]
 		if !seen {
@@ -109,10 +120,13 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 			continue
 		}
 		log.Printf("reconcile: run %s: %s: %s", st.RunID, st.Name, msg)
-		if err := s.advance(ctx, st.RunID); err != nil {
+		more, err := s.advance(ctx, st.RunID)
+		if err != nil {
 			s.abandon(ctx, st.RunID, errTypeDatabase,
 				fmt.Errorf("scheduling after lost result for %s: %w", st.Name, err))
+			continue
 		}
+		claims = append(claims, more...)
 	}
 
 	// Forget suspicions that resolved themselves: the result arrived, the step
@@ -123,6 +137,7 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 			delete(s.suspected, a)
 		}
 	}
+	return claims
 }
 
 // driverView is what reconcile learned from a driver: its state, or why it

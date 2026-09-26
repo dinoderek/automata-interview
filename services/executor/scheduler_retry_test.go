@@ -85,13 +85,11 @@ func TestNoRetryWhileDraining(t *testing.T) {
 	}
 }
 
-// A retry that is refused, with nothing else in flight, is stranded like any
-// refused step: the run fails with the refusal as its reason.
-func TestRetryRefusedWithNothingInFlightFailsRun(t *testing.T) {
+// A retry that is refused fails like any refused step.
+func TestRetryRefusedFailsRun(t *testing.T) {
 	h := newRunHarness(t, map[string][]reply{"fill_sample_plate": {accept, refuse}})
 	h.finishRetryable("fill_sample_plate", "pipette clogged")
 
-	reason := "refused by liquid-handler-1 (busy with something else) with nothing in flight to wait for"
-	h.expectStep("fill_sample_plate", StepFailed, reason)
-	h.expectRun(RunFailed, "fill_sample_plate", reason)
+	h.expectStep("fill_sample_plate", StepFailed, refusedLH)
+	h.expectRun(RunFailed, "fill_sample_plate", refusedLH)
 }

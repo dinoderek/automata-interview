@@ -262,31 +262,52 @@ func (s *Store) ListActiveRunIDs(ctx context.Context) ([]string, error) {
 	return ids, rows.Err()
 }
 
-// RecordStepRunning notes that a driver accepted a pending step. dispatched_at
-// is only stamped here, on acceptance, because the timeline treats it as the
-// moment the step started occupying its device.
-func (s *Store) RecordStepRunning(ctx context.Context, stepID string) error {
-	res, err := s.db.ExecContext(ctx,
+// ClaimStep marks a pending step dispatched -- chosen, about to be sent --
+// and returns its attempt number. The claim is written before the command is
+// sent, so no other scan can choose the step while the send is in flight, and
+// a step whose outcome is never recorded is never mistaken for pending.
+// dispatched_at is stamped here: the timeline's start, milliseconds before the
+// driver takes it.
+func (s *Store) ClaimStep(ctx context.Context, stepID string) (int, error) {
+	var attempt int
+	err := s.db.QueryRowContext(ctx,
 		`UPDATE steps
 		    SET status = $1,
 		        dispatch_count = dispatch_count + 1,
 		        dispatched_at = COALESCE(dispatched_at, now()),
 		        updated_at = now()
-		  WHERE id = $2 AND status = $3`, StepRunning, stepID, StepPending)
-	if err != nil {
-		return err
+		  WHERE id = $2 AND status = $3
+		  RETURNING dispatch_count`, StepDispatched, stepID, StepPending).Scan(&attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("step %s was not pending", stepID)
 	}
-	return requireOneRow(res, fmt.Errorf("step %s was not pending", stepID))
+	return attempt, err
 }
 
-// RecordStepFinished records a driver's result for a running step, successful
-// or not. It reports false, and changes nothing, if the step was not running in
-// that run -- a duplicate, late or foreign result.
+// RecordStepRunning notes that the driver accepted attempt of a dispatched
+// step. It reports false, changing nothing, if the step has moved on: its
+// result arrived before the ack was recorded, or a retry is a later attempt.
+func (s *Store) RecordStepRunning(ctx context.Context, stepID string, attempt int) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE steps SET status = $1, updated_at = now()
+		  WHERE id = $2 AND status = $3 AND dispatch_count = $4`,
+		StepRunning, stepID, StepDispatched, attempt)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// RecordStepFinished records a driver's result for a step on an instrument
+// (running, or dispatched if the result beat the recorded ack), successful or
+// not. It reports false, and changes nothing, otherwise -- a duplicate, late
+// or foreign result.
 func (s *Store) RecordStepFinished(ctx context.Context, runID, stepID, status, errMsg string) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
-		 WHERE id = $3 AND run_id = $4 AND status = $5`,
-		status, nullable(errMsg), stepID, runID, StepRunning)
+		 WHERE id = $3 AND run_id = $4 AND status IN ($5, $6)`,
+		status, nullable(errMsg), stepID, runID, StepRunning, StepDispatched)
 	if err != nil {
 		return false, err
 	}
@@ -300,14 +321,14 @@ func (s *Store) GetStep(ctx context.Context, runID, stepID string) (*Step, error
 		`SELECT `+stepCols+` FROM steps WHERE id = $1 AND run_id = $2`, stepID, runID))
 }
 
-// RecordStepRetrying puts a running step whose attempt failed back to pending,
-// keeping the failure in error, so it is dispatched again. finished_at stays
-// unset: the step is not finished. Reports false if the step was not running.
+// RecordStepRetrying puts a step whose attempt failed back to pending, keeping
+// the failure in error, so it is dispatched again. finished_at stays unset: the
+// step is not finished. Reports false if the step was not on an instrument.
 func (s *Store) RecordStepRetrying(ctx context.Context, runID, stepID, errMsg string) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE steps SET status = $1, error = $2, updated_at = now()
-		 WHERE id = $3 AND run_id = $4 AND status = $5`,
-		StepPending, nullable(errMsg), stepID, runID, StepRunning)
+		 WHERE id = $3 AND run_id = $4 AND status IN ($5, $6)`,
+		StepPending, nullable(errMsg), stepID, runID, StepRunning, StepDispatched)
 	if err != nil {
 		return false, err
 	}
@@ -315,14 +336,15 @@ func (s *Store) RecordStepRetrying(ctx context.Context, runID, stepID, errMsg st
 	return n == 1, err
 }
 
-// ListInFlightSteps returns every running step of a run that is still being
-// driven (running or failed_draining): the steps waiting on a driver's result.
+// ListInFlightSteps returns every step on an instrument (running or
+// dispatched) of a run that is still being driven (running or
+// failed_draining): the steps waiting on a driver.
 func (s *Store) ListInFlightSteps(ctx context.Context) ([]Step, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+stepCols+` FROM steps
-		  WHERE status = $1
-		    AND run_id IN (SELECT id FROM runs WHERE status IN ($2, $3))
-		  ORDER BY run_id, name`, StepRunning, RunRunning, RunFailedDraining)
+		  WHERE status IN ($1, $2)
+		    AND run_id IN (SELECT id FROM runs WHERE status IN ($3, $4))
+		  ORDER BY run_id, name`, StepRunning, StepDispatched, RunRunning, RunFailedDraining)
 	if err != nil {
 		return nil, err
 	}
@@ -338,14 +360,14 @@ func (s *Store) ListInFlightSteps(ctx context.Context) ([]Step, error) {
 	return out, rows.Err()
 }
 
-// RecordStepLost fails a running step whose result never arrived. It applies
-// only while the step is still on the same attempt: if the result came in, or
-// a retry went out, since the step was judged lost, it reports false.
+// RecordStepLost fails an in-flight step whose result never arrived. It
+// applies only while the step is still on the same attempt: if the result came
+// in, or a retry went out, since the step was judged lost, it reports false.
 func (s *Store) RecordStepLost(ctx context.Context, runID, stepID string, attempt int, errMsg string) (bool, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
-		 WHERE id = $3 AND run_id = $4 AND status = $5 AND dispatch_count = $6`,
-		StepFailed, nullable(errMsg), stepID, runID, StepRunning, attempt)
+		 WHERE id = $3 AND run_id = $4 AND status IN ($5, $6) AND dispatch_count = $7`,
+		StepFailed, nullable(errMsg), stepID, runID, StepRunning, StepDispatched, attempt)
 	if err != nil {
 		return false, err
 	}
@@ -353,13 +375,19 @@ func (s *Store) RecordStepLost(ctx context.Context, runID, stepID string, attemp
 	return n == 1, err
 }
 
-// RecordDispatchFailed fails a pending step whose command could not be
-// delivered or answered. The driver may or may not have taken it.
-func (s *Store) RecordDispatchFailed(ctx context.Context, stepID, errMsg string) error {
-	_, err := s.db.ExecContext(ctx,
+// RecordDispatchFailed fails attempt of a dispatched step whose command was
+// refused, or could not be delivered or answered. Reports false if the step
+// has moved on (a result arrived first).
+func (s *Store) RecordDispatchFailed(ctx context.Context, stepID string, attempt int, errMsg string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE steps SET status = $1, error = $2, finished_at = now(), updated_at = now()
-		 WHERE id = $3 AND status = $4`, StepFailed, nullable(errMsg), stepID, StepPending)
-	return err
+		 WHERE id = $3 AND status = $4 AND dispatch_count = $5`,
+		StepFailed, nullable(errMsg), stepID, StepDispatched, attempt)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 func nullable(s string) *string {
@@ -367,15 +395,4 @@ func nullable(s string) *string {
 		return nil
 	}
 	return &s
-}
-
-func requireOneRow(res sql.Result, errIfNone error) error {
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return errIfNone
-	}
-	return nil
 }

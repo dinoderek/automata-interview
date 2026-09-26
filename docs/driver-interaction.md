@@ -50,7 +50,7 @@ executor                         NATS                      driver
 | # | What happened | Executor observes | Driver executed? | Step state we write |
 |---|---|---|---|---|
 | 1 | Accepted | `ack.Accepted=true` | yes | `running`, stamp `dispatched_at` |
-| 2 | Refused | `ack.Accepted=false` | no | stays `pending` if other steps are in flight; otherwise `failed` and the run fails (see liveness.md) |
+| 2 | Refused | `ack.Accepted=false` | no | `failed`, and the run fails: the device is not in the state we believe (since round 7) |
 | 3 | No driver subscribed | `ErrNoResponders` (immediate on NATS 2.10) | **no** | v1: `failed`, run fails (could safely stay `pending` once something retries it) |
 | 4 | Ack lost / slow | timeout error | **unknown** | — |
 | 5 | Executor crashes after deciding, before the outcome is written | nothing | **unknown** | — |
@@ -65,29 +65,62 @@ Rows 4 and 5 are the only genuinely ambiguous ones.
   `DriverState().Executed`. Crash recovery is out of scope for v1.
 - Row 6: see locking below.
 
-## Why v1 has no `dispatched` state
+## `dispatched`: removed in v1, back since round 7
 
-v1 holds a single in-process mutex across *decide → send → write outcome*, in
-both `Start` and `HandleResult`. Consequences:
+**Rounds 1–6** held the scheduler's mutex across *decide → send → record
+outcome*. Nothing that makes decisions could observe a step between "chosen"
+and "outcome recorded", so a claim state had no reader and was dropped. The
+cost: a driver slow to answer held up every result and the reconcile loop for
+up to the 3s command timeout.
 
-- Nothing that makes scheduling decisions can observe a step between "chosen"
-  and "outcome recorded", so an intermediate claim state has no reader.
-- Row 6 is serialised: the early `HandleResult` blocks on the mutex and, when
-  it gets in, the step is already `running`.
+**Round 7** sends outside the lock, which is what the original analysis said
+would bring `dispatched` back:
 
-So v1's state machine is (as built, through round 6):
+1. under the lock: `pending → dispatched` (the claim: `dispatch_count+1`,
+   `dispatched_at` stamped), for every step the scan chooses;
+2. without the lock: `SendCommand`, one claim after another — all of a scan's
+   claims go out, even if an earlier one fails, since they were chosen before
+   any failure was known;
+3. under the lock: `dispatched → running` (accepted), or `→ failed` (refused,
+   or send error), conditional on the attempt.
+
+Consequences:
+
+- **Occupancy counts `dispatched`**, so no other scan can choose the step or
+  its device while the command is in flight.
+- **Row 6 (result before recorded ack)**: results apply to `dispatched` as
+  well as `running`; the late ack then changes nothing. The ack is
+  conditional on the attempt, so attempt 1's late ack cannot mark a retry's
+  attempt 2 running.
+- **Reconcile loop**: in-flight steps include `dispatched`; an in-memory set
+  of claims being sent keeps it from taking a command in flight (driver idle,
+  no record yet) for a lost result.
+- **Rows 4 and 5 (ambiguous outcomes)** now leave the step `dispatched`, never
+  `pending`: a step a driver may be running is never chosen again. At startup
+  `FailActiveRuns` counts it as in flight and the loop resolves it.
+- **A refusal fails the step.** Nothing of ours is on a device we send to
+  (occupancy counts dispatched and running, drivers free themselves before
+  reporting, one run at a time with draining runs still active). So a refusal
+  means the device is not in the state we believe — an environment error.
+
+Live: with the incubator frozen (`docker compose pause`), its command hung for
+the 3s timeout; during it, the liquid handler's result was handled and the
+next liquid-handler step sent. The run then failed as "dispatch failed,
+outcome unknown" and drained.
+
+State machine, as built:
 
 ```
-pending ──ack accepted──► running ──result ok──────────────────────► completed
-  │  ▲                    │   │
-  │  │ refused, other     │   ├──result error, not retryable──────► failed
-  │  │ work in flight     │   ├──result error, attempts used up───► failed
-  │  └────────────────────┘   ├──lost / driver unreachable (grace)─► failed   (reconcile loop)
-  │     (refusal stays        └──result error, retryable, attempts left ──► pending (sent again at once)
-  │      pending; loops back)
-  ├──send error (timeout, no responders)───────────────────────────► failed   ("dispatch failed, outcome unknown")
-  ├──refused, nothing in flight────────────────────────────────────► failed   (docs/liveness.md §1)
-  └──run failed first───────────────────────────────────────────────► skipped
+pending ──claim──► dispatched ──ack accepted──► running ──result ok──────────────────► completed
+                    │     │                        │
+                    │     └──result (beat ack)─────┤──result error, not retryable─────► failed
+                    │                              ├──result error, attempts used up──► failed
+                    ├──refused─────────────────────┼──lost / unreachable (grace)──────► failed   (reconcile loop)
+                    ├──send error──────────────────┘   (from dispatched too, if no send in flight)
+                    │   (timeout, no responders)    └──result error, retryable, attempts left ──► pending
+                    ▼
+                  failed
+pending ──run failed first──► skipped
 ```
 
 Runs: `pending → running → completed`, or `running → failed_draining →
@@ -95,35 +128,13 @@ failed` when a step fails with others still on instruments (straight to
 `failed` if none). `abandon` and `FailActiveRuns` also end runs; see
 liveness.md.
 
-`dispatched_at` is stamped only on acceptance, because the timeline uses it as
-the step's start time; stamping a refused attempt would make steps appear to
-start early and inflate overlap.
-
-The `StepDispatched` constant in `models.go` is kept (the schema comment lists
-it) but unused.
-
-## When `dispatched` becomes necessary
-
-As soon as the lock no longer spans the network call. The natural upgrade from
-an in-process mutex is a Postgres row lock (`SELECT … FOR UPDATE` on the run),
-which works across executor replicas and gives per-run locking — but you do
-not hold a transaction open across a 3s network call. The sequence becomes:
-
-1. tx: `pending → dispatched` (the claim; prevents a concurrent double-send)
-2. send, outside any lock
-3. tx: `dispatched → running` (accepted) or `→ pending` (refused)
-
-Then `dispatched` is both the double-send guard and the crash-recovery marker
-for rows 4 and 5, and `HandleResult` must accept a result from `dispatched` as
-well as `running` (row 6).
-
 ## Device occupancy
 
 The scheduler does not ask drivers whether they are busy. It derives
-occupancy from its own rows: a device with a step in `running` is skipped.
-This avoids predictable refusals and, more importantly, avoids relying on a
-refusal being retried — a refused step is only reconsidered when some other
-result triggers a rescan.
+occupancy from its own rows: a device with a step in `dispatched` or
+`running` is skipped. So our own work never causes a refusal, and a refusal
+that does happen fails the step (since round 7; before, it waited for the next
+result, or failed the run only if nothing else was in flight).
 
 Limitation with multiple concurrent runs: the occupancy query itself
 generalises if it is per-device across all running runs, but the trigger does

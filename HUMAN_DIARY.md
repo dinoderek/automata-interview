@@ -38,4 +38,9 @@ Did some refinement of the "system error" case, where we crash becu
 
 # Step 5 - One workflow only running
 
-Enforce the invariant above
+Enforce the invariant above and ran a review
+
+# Step 6 - Applied review fixes
+
+Good. Then moved to the SendDispatch finding which was not acceptable in my mind. 
+

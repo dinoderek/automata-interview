@@ -45,17 +45,22 @@ step is `running` — every one has reported. By I, a run with no step
 
 ## Why a scan maintains I (in the normal case)
 
+(Since round 7, "in flight" means `dispatched` or `running`: a scan claims
+the steps it chooses as `dispatched` and sends them after releasing the lock.)
+
 At the end of a scan on a `running` run with no failed step and not every step
-completed, suppose nothing is `running`. Then every non-completed step is
+completed, suppose nothing is in flight. Then every non-completed step is
 `pending`. The workflow is acyclic, so some pending step has every dependency
-completed: a ready step exists. With nothing `running`, our records show every
-device free, so the scan offers that step. Outcomes:
+completed: a ready step exists. With nothing in flight, our records show every
+device free, so the scan claims that step — and I holds. The send then ends in
+one of:
 
 | Driver answer | Result | I |
 |---|---|---|
 | accepted | step `running` | holds |
-| send error | run `failed` (nothing in flight) | holds — terminal |
-| **refused** | step stays `pending`, nothing `running` | **violated** — unless handled, see §1 |
+| send error | step `failed`, run fails (drains if others in flight) | holds |
+| refused | step `failed`, run fails (since round 7) | holds |
+| **refused (rounds 1–2)** | step stayed `pending`, nothing `running` | **violated** — see §1 |
 
 `failed_draining` maintains I: `fail()` chooses draining only if something is
 `running`, and every scan of a draining run finishes it once nothing is. If
@@ -66,16 +71,15 @@ that scan hits a database error, `abandon` fails the draining run outright
 
 ### 1. Every ready step refused, nothing in flight — run stalls forever
 
-**Handled (round 2.5) by failing the run.** A scan that ends with the run
-non-terminal and nothing `running` marks each refused step `failed` with
-"refused by <device> (<reason>) with nothing in flight to wait for" and fails
-the run with the most urgent one. This restores I (the run is terminal) at
-the cost of failing runs a later retry might have saved. A wake-up timer
-(R1) is the better answer, deferred until drop handling needs timers anyway.
-Tests: `TestOnlyReadyStepRefusedFailsRun`, `TestAllReadyStepsRefusedFailsRun`.
-
-A refusal leaves the step `pending` and waits for "the next result". If
-nothing of this run is in flight, there is no next result.
+**History.** Rounds 1–2: a refusal left the step `pending` to wait for "the
+next result" — with nothing of the run in flight, there was none, and the run
+hung. Round 2.5: a scan ending with nothing in flight failed the run. **Round
+7: every refusal fails its step**, because with occupancy counting our
+dispatched and running steps, our own work can never cause one: a refusal
+means the device is not in the state we believe. The section below is why
+that is an environment error. The end-of-scan check remains as a guard.
+Tests: `TestRefusalFailsStepAndRun`, `TestOnlyReadyStepRefusedFailsRun`,
+`TestAllReadyStepsRefusedFailsRun`.
 
 A refusal means the device is busy with something our records do not show.
 Our own steps never cause it: a driver frees itself *before* publishing its
@@ -151,7 +155,7 @@ of wake-ups that does not depend on a driver reporting.
 
 | Gap | Status |
 |---|---|
-| §1 refusal stall | handled — run fails immediately; timer (full R1) deferred to drop handling |
+| §1 refusal stall | cannot happen — every refusal fails its step (round 7); a timer-based retry was not built |
 | §1 two concurrent runs | prevented (round 5, R2): `Start` refuses with 409 while another run is `running` or `failed_draining` |
 | §2 abandon cannot persist | executor exits (fail-stop); on restart `FailActiveRuns` fails the run |
 | A: drops | handled — reconcile loop (R3's check, R4's trigger), fail fast; see drops.md |

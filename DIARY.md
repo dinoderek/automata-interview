@@ -24,6 +24,7 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | 4 | Going further: lost results (DROP) — reconcile loop, fail fast | all + manual drop run |
 | 5 | One run at a time, enforced at `Start` | all + live two-start check |
 | 6 | Review fixes: abandon on draining, unreachable driver, startup sweep, skipped steps, docs | all |
+| 7 | Send commands outside the lock: `dispatched` claim is back; refusal fails fast | all + frozen-driver check |
 | last | NOTES.md, drafted from this diary | — |
 
 ---
@@ -522,5 +523,74 @@ the explicit `errType` parameter (asked for), the retry path's reads.
 **Gates**
 - all pass: static, `go test -race` (33 tests + 2 subtests), live 5/5 on
   both workflows (10s / 6s), failure pass.
+
+**Time:** ~
+
+---
+
+## Round 7 — commands sent outside the lock
+
+Prompted by the review: the lock was held across `SendCommand`, so a driver
+slow to answer held up every result and the reconcile loop for up to 3s.
+Discussed first; three simplifications made it small: a result beating the
+recorded ack is just "results apply to `dispatched` too"; the reconciler just
+skips claims being sent; and a refusal fails fast.
+
+**Done**
+- `advance` claims each step it chooses (`pending → dispatched`, stamping
+  `dispatch_count` and `dispatched_at`) and returns the claims. `send` sends
+  them after the lock is released, one after another — all claims of a scan,
+  even if an earlier one fails — and `recordSend` records each outcome under
+  the lock: `dispatched → running`, or `→ failed` then `advance`.
+- `Start`, `HandleResult`, the reconciler: locked part returns claims,
+  `send` runs after unlocking.
+- Occupancy counts `dispatched`. Results, retries and lost results apply to
+  `dispatched` as well as `running`. The ack and the dispatch failure are
+  conditional on the attempt (`ClaimStep` returns it).
+- Reconciler: in-flight includes `dispatched`; the in-memory `sending` set
+  keeps it from suspecting a command still in flight.
+- **Refusal fails the step and the run**, always. The refusal machinery
+  (`refused` map, `refusals` list, wait-for-next-result) is gone. The
+  end-of-scan liveness check stays as a guard.
+- `requireOneRow` removed (unused).
+
+**Decisions**
+- *Principle updated:* "fail fast on environment errors, except a busy
+  device" becomes "a busy device cannot happen by construction; any refusal
+  is an environment error". Deliberately against the README's wording
+  ("normal, not an error"): we prevent the refusal it describes rather than
+  cope with it. NOTES.md must argue this.
+- *All claims of a scan are sent*, even after one fails: they were chosen
+  before any failure was known, and what is accepted drains. Parallel sends
+  would make order nondeterministic; cancelling the rest adds states.
+- *Attempt-conditional ack*: with the real bus a retryable failure that beats
+  its ack can get attempt 2 claimed before attempt 1's ack is recorded.
+- Side effect: rows 4/5 (ambiguous send, crash mid-dispatch) now leave the
+  step `dispatched`, never `pending`, so it is never chosen again — the
+  double-send hazard of round 4 is closed.
+
+**Tests**
+- Rewritten for fail-fast refusal: `TestRefusalFailsStepAndRun` (a claim
+  from the same scan still goes out and drains), `TestEveryClaimOfAScanFails`,
+  and the existing refused-at-start / all-refused / retry-refused tests.
+- New: `TestResultBeforeAckIsRecorded` — the bus handles the step's result
+  *inside* `SendCommand`; deadlocks (caught by a 5s guard) if the lock is held
+  across the send. `TestReconcileLeavesStepBeingSentAlone` — reconcile runs,
+  with 10× the grace, during a send. `TestLateAckDoesNotApplyToALaterAttempt`
+  (store level).
+- Deliberate breakages, each caught: lock held across the send (deadlock
+  reported), reconciler ignoring in-flight sends, ack ignoring the attempt,
+  results applying only to `running`.
+
+**Gates**
+- all pass: static, `go test -race` (35 tests + 2 subtests; the provided
+  concurrency test unchanged), live 5/5 on both workflows (10.0s / 6.06s
+  recorded; the script printed 7s for Triple Assay — whole-second polling),
+  0 refusals, failure pass.
+- Live, incubator frozen with `docker compose pause`: its command hung for
+  the 3s timeout (16:03:49–52); during it, the liquid handler's result was
+  handled and `fill_buffer_plate` sent (16:03:51). The run failed as
+  `dispatch failed, outcome unknown: … context deadline exceeded`, drained,
+  ended `failed`.
 
 **Time:** ~
