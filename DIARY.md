@@ -17,8 +17,10 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 |---|---|---|
 | 0 | git, diary, gates script, driver-interaction analysis | static |
 | 1 | Rungs 1–4 floor: execute DAG, overlap, refusal, fail hard on any driver error | static, test, live, failure |
-| 2 | Tests for the unhappy paths (fake bus: refusal, send error, failed/late result) | + failure |
-| 3 | Going further: bounded retries *or* dropped-result detection | + manual fault runs |
+| 1.1 | `failed_draining`, failure reasons on run and step, draining tests | all |
+| 2 | Tests for refusal and send errors (scripted bus); liveness analysis | all |
+| 2.5 | Liveness: fail a run that ends a scan with nothing in flight | all |
+| 3 | Going further: bounded retries of retryable failures | + manual fault runs |
 | 4 | NOTES.md, drafted from this diary | — |
 
 ---
@@ -188,5 +190,92 @@ nothing on the run said which step had stopped it.
    4.19s  failed_draining  failed_step=incubate_samples  running=fill_buffer_plate
    6.15s  failed           failed_step=incubate_samples
   ```
+
+**Time:** ~
+
+---
+
+## Round 2 — refusal and send-error paths under test
+
+**Done**
+- `harness_test.go`: the step-by-step run harness moved out of the failure
+  tests, with a `scriptedBus` that accepts by default and can be scripted per
+  step name to refuse or return an error. Records every offer (`tried`) and
+  every acceptance (`sent`).
+- `scheduler_dispatch_test.go`:
+  - refused step stays `pending` with `dispatch_count` 0 and no
+    `dispatched_at`, is not followed by another offer to the same device in
+    the same scan, and goes out on the next result;
+  - send error (timeout, and `ErrNoResponders`) fails the step as "dispatch
+    failed, outcome unknown: …", run drains then fails, recording it;
+  - a refusal plus a send error in the same scan, nothing else in flight →
+    run goes straight to `failed`.
+- `scheduler.go`: after a refusal, the device is skipped for the rest of the
+  scan. Previously the next ready step for the same device was offered
+  straight away, for a guaranteed second refusal.
+
+**Decisions**
+- *Refused devices are tracked separately from `busy`.* `busy` doubles as
+  "our steps on instruments", which decides whether a failure drains. Folding
+  a refused device into it would make a failure in the same scan wait in
+  `failed_draining` for a result that never comes. The third test pins this.
+- Checked the new tests by breaking the code on purpose: dropping the
+  skip-after-refusal fails the refusal test; counting a refusal as busy fails
+  the in-flight test.
+
+**Liveness analysis** (`docs/liveness.md`)
+- Invariant I: at every quiescent point, each non-terminal run has at least
+  one step `running`. Assumption A: every `running` step eventually yields a
+  recorded result. Variant: attempts are bounded. I ∧ A ⇒ every run
+  terminates.
+- A scan maintains I except when every ready step is refused and nothing is
+  in flight — then the run stalls forever. Reproduced live: two runs started
+  back to back; the second's `fill_sample_plate` was refused (liquid handler
+  busy with the first run) and it sat `running` with every step pending.
+  "One run at a time" is assumed, not enforced.
+- A fails for dropped results, results lost while the executor is down, and
+  DB errors while recording a result.
+- Next: R1 — a wake-up timer when a scan ends with nothing in flight, and a
+  no-progress deadline that fails the run.
+
+**Gates**
+- all: static, `go test -race` (11 tests + 2 subtests), live 5/5 on both
+  workflows (10s / 6s, 0 refusals), failure pass.
+
+**Time:** ~
+
+---
+
+## Round 2.5 — liveness: never end a scan with nothing in flight
+
+**Done**
+- End of `advance`: if the run is still non-terminal and nothing is
+  `running`, no result will ever come to trigger another scan. Every refused
+  step is marked `failed` with "refused by <device> (<reason>) with nothing in
+  flight to wait for", and the run fails with the most urgent one as its
+  reason. (If nothing was refused either — impossible for an acyclic workflow —
+  the run fails with no step named.)
+- Tests, single run, scripted bus: the only ready step refused at start;
+  every ready step refused mid-run on two devices (each refused step records
+  its reason, the run records the more urgent, un-offered steps stay pending).
+- `docs/liveness.md` and `docs/driver-interaction.md` updated.
+
+**Decisions**
+- *Fail instead of a timer, for now.* A refusal we cannot explain is treated
+  like any other driver error: something physical is holding the device, or
+  the driver is misbehaving. Timers come with drop handling, which needs them
+  anyway; then this becomes "retry with backoff until a deadline".
+- *Refused steps are marked `failed`*, not left `pending`, so `failed_step`
+  on the run points at a step that shows the failure.
+- *Not enforcing one-run-at-a-time at `Start`.* It is an assumption of the
+  exercise; a violation now fails the second run with a clear reason rather
+  than hanging it.
+
+**Gates**
+- all pass: static, `go test -race` (13 tests + 2 subtests), live 5/5 on both
+  workflows (10s / 6s, 0 refusals), failure.
+- Live re-run of the two-runs reproduction: the second run now ends `failed`,
+  `failed_step=fill_sample_plate`, `error=refused by liquid-handler-1 (busy
+  with fill_sample_plate) with nothing in flight to wait for`.
 
 **Time:** ~

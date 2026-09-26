@@ -1,5 +1,8 @@
 # Driver interaction model
 
+See also [liveness.md](liveness.md): when a run is guaranteed to finish, and
+where it is not.
+
 How the executor and a driver talk, what can go wrong at each point, and what
 that means for step state. Sources: `services/worker/main.go`,
 `services/executor/bus.go`.
@@ -47,7 +50,7 @@ executor                         NATS                      driver
 | # | What happened | Executor observes | Driver executed? | Step state we write |
 |---|---|---|---|---|
 | 1 | Accepted | `ack.Accepted=true` | yes | `running`, stamp `dispatched_at` |
-| 2 | Refused | `ack.Accepted=false` | no | stays `pending` |
+| 2 | Refused | `ack.Accepted=false` | no | stays `pending` if other steps are in flight; otherwise `failed` and the run fails (see liveness.md) |
 | 3 | No driver subscribed | `ErrNoResponders` (immediate on NATS 2.10) | **no** | v1: `failed`, run fails (could safely stay `pending` once something retries it) |
 | 4 | Ack lost / slow | timeout error | **unknown** | — |
 | 5 | Executor crashes after deciding, before the outcome is written | nothing | **unknown** | — |

@@ -131,8 +131,10 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 		return s.store.FinishRun(ctx, runID, RunRunning, RunCompleted)
 	}
 
+	refused := make(map[string]bool) // devices that refused during this scan
+	var refusals []Step              // steps refused, with the reason in Error
 	for _, st := range readyByPriority(steps, status) {
-		if busy[st.DeviceID] {
+		if busy[st.DeviceID] || refused[st.DeviceID] {
 			continue
 		}
 		ack, err := s.bus.SendCommand(ctx, StepCommand{
@@ -150,8 +152,15 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 		if !ack.Accepted {
 			// Our own records say the device is free, so something we do not
 			// know about is using it. The step stays pending and is looked at
-			// again on the next result.
+			// again on the next result -- if one is coming (see below). Offer
+			// the device nothing else this scan; it is not ours to count as in
+			// flight, so it stays out of busy.
 			log.Printf("scheduler: %s refused %s: %s", st.DeviceID, st.Name, ack.Reason)
+			refused[st.DeviceID] = true
+			msg := fmt.Sprintf("refused by %s (%s) with nothing in flight to wait for",
+				st.DeviceID, ack.Reason)
+			st.Error = &msg
+			refusals = append(refusals, st)
 			continue
 		}
 		if err := s.store.RecordStepRunning(ctx, st.ID); err != nil {
@@ -159,6 +168,22 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 		}
 		busy[st.DeviceID] = true
 		log.Printf("scheduler: dispatched %s to %s", st.Name, st.DeviceID)
+	}
+
+	// Liveness (docs/liveness.md): a scan must not end with the run unfinished
+	// and nothing in flight, because only a result triggers the next scan.
+	// Every run that gets here had its ready steps refused. With no timer to
+	// try again later, fail the run rather than let it hang.
+	if len(busy) == 0 {
+		if len(refusals) == 0 {
+			return s.fail(ctx, runID, "", "no step could be dispatched and none is in flight", 0)
+		}
+		for _, st := range refusals {
+			if err := s.store.RecordDispatchFailed(ctx, st.ID, *st.Error); err != nil {
+				return fmt.Errorf("record refusal of %s: %w", st.Name, err)
+			}
+		}
+		return s.fail(ctx, runID, refusals[0].Name, *refusals[0].Error, 0)
 	}
 	return nil
 }
