@@ -21,6 +21,9 @@ const (
 	StepRunning    = "running"
 	StepCompleted  = "completed"
 	StepFailed     = "failed"
+
+	// StepSkipped: never ran, and never will -- its run failed first.
+	StepSkipped = "skipped"
 )
 
 type Device struct {

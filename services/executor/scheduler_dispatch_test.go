@@ -78,7 +78,7 @@ func TestRefusalIsNotCountedAsInFlight(t *testing.T) {
 	h.finish("fill_sample_plate", "")
 
 	h.expectRun(RunFailed, "incubate_samples", "dispatch failed, outcome unknown: "+sendErr.Error())
-	h.expectStep("fill_reagent_plate", StepPending, "")
+	h.expectStep("fill_reagent_plate", StepSkipped, "") // refused, never ran
 }
 
 // Liveness: the only ready step is refused and nothing else is in flight, so
@@ -96,7 +96,7 @@ func TestOnlyReadyStepRefusedFailsRun(t *testing.T) {
 
 // Mid-run, every ready step is refused, on different devices. Each refused
 // step records why; the run records the most urgent one. Steps that were never
-// offered stay pending.
+// offered are skipped.
 func TestAllReadyStepsRefusedFailsRun(t *testing.T) {
 	h := newRunHarness(t, map[string][]reply{
 		"fill_reagent_plate": {refuse},
@@ -108,7 +108,7 @@ func TestAllReadyStepsRefusedFailsRun(t *testing.T) {
 	h.expectStep("fill_reagent_plate", StepFailed, reagent)
 	h.expectStep("incubate_samples", StepFailed,
 		"refused by incubator-1 (busy with something else) with nothing in flight to wait for")
-	h.expectStep("fill_buffer_plate", StepPending, "")
+	h.expectStep("fill_buffer_plate", StepSkipped, "")
 	h.expectRun(RunFailed, "fill_reagent_plate", reagent)
 	h.expectSent("fill_sample_plate")
 }

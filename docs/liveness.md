@@ -11,9 +11,11 @@ hang".
 
 ## Invariant, assumption, variant
 
-The scheduler is purely event-driven: it only acts in `Start` and
-`HandleResult`. So a run makes progress only if something is guaranteed to
-call it again.
+The scheduler was originally purely event-driven: it acted only in `Start`
+and `HandleResult`, so a run made progress only if something was guaranteed
+to call it again. Since round 4 the reconcile loop (every 1s) also acts, but
+only on steps in `running`; this analysis is about the event-driven core, and
+the loop is how assumption A is shored up.
 
 > **I (invariant).** Whenever the scheduler is quiescent (not holding its
 > mutex), every run in `running` or `failed_draining` has at least one step in
@@ -56,7 +58,9 @@ device free, so the scan offers that step. Outcomes:
 | **refused** | step stays `pending`, nothing `running` | **violated** — unless handled, see §1 |
 
 `failed_draining` maintains I: `fail()` chooses draining only if something is
-`running`, and every scan of a draining run finishes it once nothing is.
+`running`, and every scan of a draining run finishes it once nothing is. If
+that scan hits a database error, `abandon` fails the draining run outright
+(before round 6 it silently did nothing to a draining run, leaving it stuck).
 
 ## Where I does not hold
 
@@ -99,8 +103,9 @@ can be:
 ### 2. `abandon` cannot persist the failure
 
 Every error that reaches `abandon` is a database error (driver errors are step
-failures). `abandon` fails the run with `database error: <what we were
-doing>: <cause>`, recorded even if the caller's context was cancelled.
+failures). `abandon` fails the run — `running` or `failed_draining` — keeping
+its first failure if it has one, otherwise recording `database error: <what we
+were doing>: <cause>`, even if the caller's context was cancelled.
 
 If the database is unavailable, that write fails too. **The executor then
 exits** (fail-stop). Its table may no longer match the instruments — if the
@@ -109,13 +114,16 @@ failed write was a driver's *acceptance* (`RecordStepRunning`), the step reads
 a double execution. Stopping prevents that. Nothing restarts the executor
 automatically (no restart policy in compose).
 
-After a manual restart the reconcile loop resolves what it can: a step left
-`running` whose driver is idle is failed as a lost result (observed live:
-Postgres stopped mid-run → executor exited → restarted → run `failed`,
-`result lost: … outcome unknown`). A step left `pending` while it actually
-ran is not detectable, and a restart could send it again. The proper fix is
-the write-ahead `dispatched` state (claim before sending, see
-driver-interaction.md).
+After a manual restart, `FailActiveRuns` (round 6) fails every run left
+active — `executor restarted: run was active when the executor started;
+outcome unknown` — and nothing is resumed. Steps still `running` drain: their
+results, or the reconcile loop, finish the run. (Before round 6 the loop alone
+resolved what it could — observed live: Postgres stopped mid-run → executor
+exited → restarted → run `failed`, `result lost: … outcome unknown`.) A step
+left `pending` while it actually ran is not detectable; since the run is
+failed rather than resumed, it is never sent again. The proper fix, needed to
+*resume* runs, is the write-ahead `dispatched` state (claim before sending,
+see driver-interaction.md).
 
 ## Where A does not hold
 
@@ -145,9 +153,10 @@ of wake-ups that does not depend on a driver reporting.
 |---|---|
 | §1 refusal stall | handled — run fails immediately; timer (full R1) deferred to drop handling |
 | §1 two concurrent runs | prevented (round 5, R2): `Start` refuses with 409 while another run is `running` or `failed_draining` |
-| §2 abandon cannot persist | accepted — needs the database back; R4 would recover |
+| §2 abandon cannot persist | executor exits (fail-stop); on restart `FailActiveRuns` fails the run |
 | A: drops | handled — reconcile loop (R3's check, R4's trigger), fail fast; see drops.md |
-| A: restarts, lost results | accepted — R4 not planned; described in NOTES.md |
+| A: unreachable driver | handled (round 6) — treated like a lost result: failed after the grace, `driver unreachable: …` |
+| A: restarts, lost results | runs left active are failed at startup (round 6), never resumed |
 
 ## Consequence of enforcing one run at a time
 
@@ -155,7 +164,10 @@ A run that never reaches a terminal status now blocks **every** later start,
 not just itself. Two such runs were found in the local database when the rule
 went in — both left over from before the fixes above (one `running` with
 every step pending, one `failed_draining` with nothing in flight) — and were
-marked `aborted` by hand. Anything that leaves a run non-terminal (a driver
-that stays unreachable, an executor that exited, §2) now needs an operator.
-There is no abort endpoint yet; `aborted` exists in the schema but nothing
-sets it.
+marked `aborted` by hand.
+
+Round 6 closed the known ways to get there: `abandon` now ends draining runs,
+an unreachable driver's step fails after the grace, and a restart fails every
+run left active. What remains needs an operator: an instrument that reports
+itself busy with our step for ever, or a database that stays down. There is
+no abort endpoint; `aborted` exists in the schema but nothing sets it.

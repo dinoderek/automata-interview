@@ -14,7 +14,8 @@ import (
 // progress: every reconcileEvery it compares each running step with what its
 // driver says. A step whose driver is no longer working on it, and stays that
 // way for lostGrace, lost its result. Nothing says whether it succeeded, so it
-// fails as "outcome unknown", like a command that timed out.
+// fails as "outcome unknown", like a command that timed out. A driver that
+// cannot be asked counts the same: we cannot tell it is still working.
 
 const (
 	reconcileEvery = 1 * time.Second
@@ -62,18 +63,16 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 	// Outside the lock: DriverState can take seconds, and results must not
 	// queue behind it. Our steps were read first, then the drivers: a step we
 	// read as running was already accepted, so no driver snapshot predates it.
-	states := make(map[string]DriverState)
+	views := make(map[string]driverView)
 	for _, st := range inFlight {
-		if _, done := states[st.DeviceID]; done {
+		if _, done := views[st.DeviceID]; done {
 			continue
 		}
 		ds, err := s.bus.DriverState(ctx, st.DeviceID)
 		if err != nil {
-			// No verdict on an unreachable driver; its steps wait.
 			log.Printf("reconcile: state of %s: %v", st.DeviceID, err)
-			continue
 		}
-		states[st.DeviceID] = ds
+		views[st.DeviceID] = driverView{ds, err}
 	}
 
 	s.mu.Lock()
@@ -81,9 +80,9 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 	now := s.now()
 	stillSuspected := make(map[attempt]bool)
 	for _, st := range inFlight {
-		ds, ok := states[st.DeviceID]
-		if !ok || (ds.Busy && ds.CurrentStep == st.Name) {
-			continue // still working, or we cannot tell
+		v := views[st.DeviceID]
+		if v.err == nil && v.state.Busy && v.state.CurrentStep == st.Name {
+			continue // still working on it
 		}
 
 		a := attempt{st.ID, st.DispatchCount}
@@ -99,7 +98,7 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 
 		// Conditional on the attempt: a result recorded, or a retry sent,
 		// since the snapshot makes this a no-op.
-		msg := lostMessage(st, ds)
+		msg := lostMessage(st, v)
 		lost, err := s.store.RecordStepLost(ctx, st.RunID, st.ID, st.DispatchCount, msg)
 		if err != nil {
 			s.abandon(ctx, st.RunID, errTypeDatabase,
@@ -126,11 +125,21 @@ func (s *Scheduler) reconcileSteps(ctx context.Context, inFlight []Step) {
 	}
 }
 
-// lostMessage says what the driver knows about a step we lost. Either way the
-// outcome is unknown; the difference helps whoever reads it.
-func lostMessage(st Step, ds DriverState) string {
+// driverView is what reconcile learned from a driver: its state, or why it
+// could not be asked.
+type driverView struct {
+	state DriverState
+	err   error
+}
+
+// lostMessage says why a step's outcome is unknown, as "<type>: <detail>".
+func lostMessage(st Step, v driverView) string {
+	if v.err != nil {
+		return fmt.Sprintf("driver unreachable: %s did not answer while running %s (attempt %d): %v; outcome unknown",
+			st.DeviceID, st.Name, st.DispatchCount, v.err)
+	}
 	runs := 0
-	for _, id := range ds.Executed {
+	for _, id := range v.state.Executed {
 		if id == st.ID {
 			runs++
 		}

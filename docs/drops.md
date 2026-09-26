@@ -60,11 +60,13 @@ in-flight work, not to run size or history. Idle system: one empty query.
 
 ## Out of scope
 
-- **Executor restarts.** The loop happens to pick up `running` steps left
-  from before a restart, but nothing resumes runs deliberately, and the
-  in-memory suspicions start over.
-- **Unreachable driver.** No verdict: its steps wait, and the run can hang
-  while it stays unreachable.
+- **Executor restarts.** Nothing is resumed: `FailActiveRuns` fails every run
+  left active at startup (round 6), and the loop drains what was in flight.
+  In-memory suspicions start over.
+- **Unreachable driver.** *Handled since round 6:* a `DriverState` error
+  counts as "not busy with this step", so the step fails after the same
+  grace with `driver unreachable: …; outcome unknown` — consistent with a
+  command to that driver failing at once.
 - **An instrument busy with our step for ever.** Believed indefinitely. A
   maximum duration per step would fail such a run (it cannot be cancelled).
 - **Refusals** still fail the run rather than being retried with backoff

@@ -19,7 +19,7 @@ const maxAttempts = 3
 //
 // Design (see docs/driver-interaction.md and DIARY.md):
 //
-//   - One run at a time is assumed.
+//   - One run at a time, enforced at Start (Store.StartRun).
 //   - Every decision happens under one mutex, held across decide -> send ->
 //     record outcome. That is what stops two simultaneous results both deciding
 //     the same step is runnable, and it is why steps need no "dispatched" state:
@@ -31,6 +31,7 @@ const maxAttempts = 3
 //     could not be delivered or answered. The run records the first failed step
 //     and its reason. If steps are still on instruments, which cannot be
 //     cancelled, the run is failed_draining until they report, then failed.
+//     Steps that never ran are marked skipped.
 //   - Except: a failed step the driver calls retryable is sent again, up to
 //     maxAttempts in all, while the run is still running.
 //   - Results can be lost. A reconcile loop (reconciler.go) compares running
@@ -218,8 +219,8 @@ func (s *Scheduler) advance(ctx context.Context, runID string) error {
 			// The driver may or may not have taken it. Fail rather than risk
 			// running it twice.
 			msg := fmt.Sprintf("dispatch failed, outcome unknown: %v", err)
-			if rerr := s.store.RecordDispatchFailed(ctx, st.ID, msg); rerr != nil {
-				log.Printf("scheduler: record dispatch failure for %s: %v", st.Name, rerr)
+			if err := s.store.RecordDispatchFailed(ctx, st.ID, msg); err != nil {
+				return fmt.Errorf("recording dispatch failure of %s: %w", st.Name, err)
 			}
 			return s.fail(ctx, runID, st.Name, msg, len(busy))
 		}
@@ -269,10 +270,17 @@ func (s *Scheduler) fail(ctx context.Context, runID, stepName, reason string, in
 	if inFlight > 0 {
 		status = RunFailedDraining
 	}
-	log.Printf("scheduler: run %s %s: %s: %s (%d step(s) still on instruments)",
-		runID, status, stepName, reason, inFlight)
+	cause := reason
+	if stepName != "" {
+		cause = stepName + ": " + reason
+	}
+	log.Printf("scheduler: run %s %s: %s (%d step(s) still on instruments)",
+		runID, status, cause, inFlight)
 	if err := s.store.FailRun(ctx, runID, status, stepName, reason); err != nil {
 		return fmt.Errorf("failing run: %w", err)
+	}
+	if err := s.store.SkipPendingSteps(ctx, runID); err != nil {
+		return fmt.Errorf("skipping steps that never ran: %w", err)
 	}
 	return nil
 }
@@ -282,24 +290,77 @@ func (s *Scheduler) fail(ctx context.Context, runID, stepName, reason string, in
 // here -- they are step failures.
 const errTypeDatabase = "database error"
 
+// errTypeRestart is the error type of runs failed by FailActiveRuns.
+const errTypeRestart = "executor restarted"
+
 // abandon is the last resort when the scheduler itself cannot make progress:
-// fail the run rather than leave it running with nothing driving it. The run's
-// error reads "<errType>: <cause>". No step is to blame, and whether anything
-// is still on an instrument is unknown, so it goes straight to failed.
+// fail the run -- running or draining -- rather than leave it active with
+// nothing driving it. Whether anything is still on an instrument is unknown,
+// so it goes straight to failed. The run keeps its first failure if it has
+// one; otherwise its error reads "<errType>: <cause>".
 //
-// If even that cannot be recorded, the executor exits. Its table no longer
-// matches the instruments -- a step a driver accepted may still read pending
-// -- and carrying on could send such a step again. Stopping is the safe
-// failure; nothing restarts the executor automatically.
+// If that cannot be recorded, the executor exits. Its table no longer matches
+// the instruments -- a step a driver accepted may still read pending -- and
+// carrying on could send such a step again. Stopping is the safe failure;
+// nothing restarts the executor automatically.
 func (s *Scheduler) abandon(ctx context.Context, runID, errType string, cause error) {
 	reason := errType + ": " + cause.Error()
 	log.Printf("scheduler: run %s failed: %s", runID, reason)
 	// The failure is recorded even if the caller's context is what failed.
 	ctx = context.WithoutCancel(ctx)
-	if err := s.store.FailRun(ctx, runID, RunFailed, "", reason); err != nil {
+	abandoned, err := s.store.AbandonRun(ctx, runID, reason)
+	if err == nil && abandoned {
+		err = s.store.SkipPendingSteps(ctx, runID)
+	}
+	if err != nil {
 		s.fatal("scheduler: cannot record failure of run %s (%s): %v -- stopping rather than schedule from state that may not match the instruments",
 			runID, reason, err)
+		return
 	}
+	if !abandoned {
+		log.Printf("scheduler: run %s had already ended", runID)
+	}
+}
+
+// FailActiveRuns is called once at startup, before results are handled. A run
+// still active was being driven by an executor that has gone, and results
+// published meanwhile are lost, so its outcome is unknown: fail it. Steps
+// still on instruments drain as usual -- their results, or the reconcile loop,
+// finish the run.
+func (s *Scheduler) FailActiveRuns(ctx context.Context) error {
+	ids, err := s.store.ListActiveRunIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("listing active runs: %w", err)
+	}
+	return s.failActiveRuns(ctx, ids)
+}
+
+// failActiveRuns fails the given runs as FailActiveRuns does. Tests call it
+// with their own runs, since the test database is shared.
+func (s *Scheduler) failActiveRuns(ctx context.Context, ids []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		steps, err := s.store.ListSteps(ctx, id)
+		if err != nil {
+			return fmt.Errorf("listing steps of %s: %w", id, err)
+		}
+		inFlight := 0
+		for _, st := range steps {
+			if st.Status == StepRunning {
+				inFlight++
+			}
+		}
+		// Only a running run changes here; a draining run keeps its first
+		// failure. advance then finishes any run with nothing in flight.
+		if err := s.fail(ctx, id, "", errTypeRestart+": run was active when the executor started; outcome unknown", inFlight); err != nil {
+			return err
+		}
+		if err := s.advance(ctx, id); err != nil {
+			return fmt.Errorf("finishing %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // readyByPriority returns the pending steps whose dependencies have all

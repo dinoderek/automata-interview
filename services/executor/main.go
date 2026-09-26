@@ -49,6 +49,12 @@ func main() {
 	store := NewStore(db)
 	sched := NewScheduler(store, bus)
 
+	// A run left active by a previous executor cannot be resumed safely; fail
+	// it before handling any results. See Scheduler.FailActiveRuns.
+	if err := sched.FailActiveRuns(context.Background()); err != nil {
+		log.Fatalf("Failed to fail runs left active: %v", err)
+	}
+
 	if err := bus.OnStepResult(func(ctx context.Context, res StepResult) {
 		sched.HandleResult(ctx, res)
 	}); err != nil {

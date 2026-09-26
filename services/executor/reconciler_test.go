@@ -101,15 +101,22 @@ func TestDroppedResultWhileDrainingEndsRun(t *testing.T) {
 	h.expectRun(RunFailed, "incubate_samples", "incubator on fire")
 }
 
-// A driver that cannot be reached gives no verdict: its steps are left alone.
-func TestUnreachableDriverGivesNoVerdict(t *testing.T) {
+// A driver that cannot be asked might still be working, or might not: we
+// cannot tell, so after the same grace its step fails as outcome unknown --
+// as a command to that driver would have.
+func TestUnreachableDriverFailsStepAfterGrace(t *testing.T) {
 	h := newRunHarness(t, nil)
 	h.bus.setState("liquid-handler-1", driverAnswer{err: errUnreachable})
-	for range 3 {
-		h.reconcile()
-		h.tick(lostGrace)
-	}
+	h.reconcile()
 	h.expectStep("fill_sample_plate", StepRunning, "")
+
+	h.tick(lostGrace)
+	h.reconcile()
+	reason := "driver unreachable: liquid-handler-1 did not answer while running fill_sample_plate (attempt 1): " +
+		errUnreachable.Error() + "; outcome unknown"
+	h.expectStep("fill_sample_plate", StepFailed, reason)
+	h.expectRun(RunFailed, "fill_sample_plate", reason)
+	h.expectStep("read_plate", StepSkipped, "")
 }
 
 // A driver with no record of the step (it restarted, and forgot) is also an

@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -28,6 +29,7 @@ func driveToIncubatorFailure(h *runHarness) {
 
 	h.finish("incubate_samples", "incubator on fire")
 	h.expectRun(RunFailedDraining, "incubate_samples", "incubator on fire")
+	h.expectStep("warm_reagent_plate", StepSkipped, "") // at once, not after draining
 	h.expectStep("incubate_samples", StepFailed, "incubator on fire")
 	h.expectStep("fill_buffer_plate", StepRunning, "")
 }
@@ -44,9 +46,11 @@ func TestFailureDrainsInFlightSteps(t *testing.T) {
 	h.expectRun(RunFailed, "incubate_samples", "incubator on fire")
 
 	// warm_reagent_plate became runnable (its dependency completed and the
-	// incubator is free) but the run had failed.
+	// incubator is free) but the run had failed: skipped, like the rest.
 	h.expectSent(sentAtFailure...)
-	h.expectStep("warm_reagent_plate", StepPending, "")
+	for _, name := range []string{"warm_reagent_plate", "combine", "read_plate"} {
+		h.expectStep(name, StepSkipped, "")
+	}
 }
 
 // A second failure while draining is recorded on its step, but the run keeps
@@ -122,4 +126,50 @@ func TestAbandonExitsWhenFailureCannotBeRecorded(t *testing.T) {
 		t.Fatalf("did not exit as expected; fatal message: %q", exited)
 	}
 	h.expectRun(RunRunning, "", "") // nothing could be written
+}
+
+// A scheduler error while a run drains still ends it. Before, abandon only
+// failed a running run: on a draining run it changed nothing, reported no
+// error, and the run stayed failed_draining -- blocking every later start.
+func TestAbandonEndsDrainingRunKeepingFirstFailure(t *testing.T) {
+	h := newRunHarness(t, nil)
+	driveToIncubatorFailure(h)
+
+	h.sched.abandon(h.ctx, h.runID, errTypeDatabase, errors.New("connection reset"))
+	h.expectRun(RunFailed, "incubate_samples", "incubator on fire")
+}
+
+// At startup, a run left active by a previous executor is failed: outcome
+// unknown. What is still on an instrument drains as usual.
+func TestFailActiveRunsAtStartup(t *testing.T) {
+	h := newRunHarness(t, nil) // fill_sample_plate on the liquid handler
+	fresh := NewScheduler(h.store, h.bus)
+	if err := fresh.failActiveRuns(h.ctx, []string{h.runID}); err != nil {
+		t.Fatalf("failActiveRuns: %v", err)
+	}
+
+	reason := "executor restarted: run was active when the executor started; outcome unknown"
+	h.expectRun(RunFailedDraining, "", reason)
+	h.expectStep("incubate_samples", StepSkipped, "")
+
+	h.finish("fill_sample_plate", "")
+	h.expectRun(RunFailed, "", reason)
+}
+
+// A run stuck draining with nothing left on an instrument -- nothing would
+// ever finish it -- is finished at startup, keeping its first failure.
+func TestFailActiveRunsFinishesStuckDrainingRun(t *testing.T) {
+	h := newRunHarness(t, nil)
+	driveToIncubatorFailure(h)
+	// fill_buffer_plate's result recorded, but the run never moved on.
+	c := h.bus.sent()[3]
+	if _, err := h.store.RecordStepFinished(h.ctx, h.runID, c.StepID, StepCompleted, ""); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	h.expectRun(RunFailedDraining, "incubate_samples", "incubator on fire")
+
+	if err := NewScheduler(h.store, h.bus).failActiveRuns(h.ctx, []string{h.runID}); err != nil {
+		t.Fatalf("failActiveRuns: %v", err)
+	}
+	h.expectRun(RunFailed, "incubate_samples", "incubator on fire")
 }

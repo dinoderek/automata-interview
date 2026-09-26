@@ -23,7 +23,8 @@ the quality gates (`scripts/gates.sh`), and is reviewed before the next starts.
 | 3 | Going further: bounded retries of retryable failures | all + manual fault runs |
 | 4 | Going further: lost results (DROP) — reconcile loop, fail fast | all + manual drop run |
 | 5 | One run at a time, enforced at `Start` | all + live two-start check |
-| 4 | NOTES.md, drafted from this diary | — |
+| 6 | Review fixes: abandon on draining, unreachable driver, startup sweep, skipped steps, docs | all |
+| last | NOTES.md, drafted from this diary | — |
 
 ---
 
@@ -466,5 +467,60 @@ Design discussed first, recorded in `docs/drops.md`.
 - Live: two runs started back to back → A `200`, B `409 {"error":"another run
   is active: run-514c550699dc"}`, B stays pending; after A completed, B
   started (`200`) and completed.
+
+**Time:** ~
+
+---
+
+## Round 6 — review fixes
+
+A review agent read the whole submission against README.md and our
+principles (one run at a time; fail fast on system errors; fail fast on
+environment errors except a busy device and retryable failures; simplicity;
+the 2-hour brief). Findings taken: #1, #2, #4, #6, #8, #9. Kept as they were:
+the explicit `errType` parameter (asked for), the retry path's reads.
+
+**Done**
+- **#1 (bug) `abandon` on a draining run.** `FailRun` only changes a
+  `running` run and ignored rows affected, so `abandon` on a
+  `failed_draining` run did nothing and reported success; with nothing in
+  flight the run stayed draining for ever and, since round 5, blocked every
+  start. New `Store.AbandonRun`: `running` or `failed_draining` → `failed`,
+  keeping the first failure (`COALESCE`). Test:
+  `TestAbandonEndsDrainingRunKeepingFirstFailure`.
+- **#4 Unreachable driver.** A `DriverState` error now counts as "not busy
+  with this step": the step fails after the same grace with `driver
+  unreachable: <device> did not answer while running <step> (attempt n):
+  <err>; outcome unknown`. Consistent with a send to that driver failing at
+  once. The old test that pinned "no verdict" is now
+  `TestUnreachableDriverFailsStepAfterGrace`.
+- **#8** A failure to record a dispatch failure is now an error (→ abandon),
+  as in the refusal path, instead of only a log line.
+- **#2 Startup sweep.** `FailActiveRuns` runs in `main` before results are
+  handled: every run left active fails with `executor restarted: run was
+  active when the executor started; outcome unknown`; steps still on
+  instruments drain as usual. Nothing is resumed — so a step whose acceptance
+  was never recorded is never sent again. Tests: `TestFailActiveRunsAtStartup`,
+  `TestFailActiveRunsFinishesStuckDrainingRun`.
+- **#6 `skipped`.** When a run fails (`fail`, `abandon`, the sweep), its
+  pending steps become `skipped`: never ran, never will. At the moment of
+  failure, not after draining.
+- **#9 Docs.** Stale "one run at a time is assumed"; liveness.md's
+  "purely event-driven" and draining argument; driver-interaction.md's state
+  diagram redrawn as built; drops.md out-of-scope list; plan table.
+- Log line for a failure with no step no longer prints `: :`.
+
+**Checks**
+- Deliberate breakages: `AbandonRun` from `running` only → the draining
+  abandon test fails; sweep without `advance` → the stuck-draining test fails.
+- Live: restarted the executor 3s into a run. The new executor failed it
+  (`failed_draining`, 2 steps in flight), subscribed, received both real
+  results, drained to `failed`; the four steps that never ran are `skipped`.
+- check-failure now shows `combine`, `read_plate`, `warm_reagent_plate` as
+  `skipped`.
+
+**Gates**
+- all pass: static, `go test -race` (33 tests + 2 subtests), live 5/5 on
+  both workflows (10s / 6s), failure pass.
 
 **Time:** ~

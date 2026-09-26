@@ -75,15 +75,25 @@ both `Start` and `HandleResult`. Consequences:
 - Row 6 is serialised: the early `HandleResult` blocks on the mutex and, when
   it gets in, the step is already `running`.
 
-So v1's state machine is:
+So v1's state machine is (as built, through round 6):
 
 ```
-pending ──ack accepted──► running ──result ok──────► completed
-   ▲  │                      │
-   └──┘ refused /            └──result error──────► failed
-        no responders
-pending ──send error (timeout)──────────────────────► failed   ("dispatch outcome unknown")
+pending ──ack accepted──► running ──result ok──────────────────────► completed
+  │  ▲                    │   │
+  │  │ refused, other     │   ├──result error, not retryable──────► failed
+  │  │ work in flight     │   ├──result error, attempts used up───► failed
+  │  └────────────────────┘   ├──lost / driver unreachable (grace)─► failed   (reconcile loop)
+  │     (refusal stays        └──result error, retryable, attempts left ──► pending (sent again at once)
+  │      pending; loops back)
+  ├──send error (timeout, no responders)───────────────────────────► failed   ("dispatch failed, outcome unknown")
+  ├──refused, nothing in flight────────────────────────────────────► failed   (docs/liveness.md §1)
+  └──run failed first───────────────────────────────────────────────► skipped
 ```
+
+Runs: `pending → running → completed`, or `running → failed_draining →
+failed` when a step fails with others still on instruments (straight to
+`failed` if none). `abandon` and `FailActiveRuns` also end runs; see
+liveness.md.
 
 `dispatched_at` is stamped only on acceptance, because the timeline uses it as
 the step's start time; stamping a refused attempt would make steps appear to

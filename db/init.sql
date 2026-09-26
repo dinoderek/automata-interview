@@ -33,7 +33,8 @@ CREATE TABLE runs (
 
 -- One node of the workflow DAG, for one run.
 -- depends_on holds the names of steps in the same run that must finish first.
--- status: pending | dispatched | running | completed | failed
+-- status: pending | running | completed | failed | skipped
+--   skipped: never ran; the run failed first. (dispatched is unused.)
 CREATE TABLE steps (
     id            TEXT PRIMARY KEY,
     run_id        TEXT        NOT NULL REFERENCES runs(id),

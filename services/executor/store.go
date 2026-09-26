@@ -217,6 +217,51 @@ func (s *Store) FailRun(ctx context.Context, id, status, stepName, reason string
 	return err
 }
 
+// AbandonRun fails an active run (running or failed_draining) outright, for a
+// scheduler error. A failure already recorded on the run is kept: the first
+// failure is the reason it stopped. Reports false if the run was not active.
+func (s *Store) AbandonRun(ctx context.Context, id, reason string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE runs
+		    SET status = $1, error = COALESCE(error, $2), finished_at = now(), updated_at = now()
+		  WHERE id = $3 AND status IN ($4, $5)`,
+		RunFailed, nullable(reason), id, RunRunning, RunFailedDraining)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// SkipPendingSteps marks every step of a failed run that never ran as skipped,
+// so it is not mistaken for one waiting its turn.
+func (s *Store) SkipPendingSteps(ctx context.Context, runID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE steps SET status = $1, updated_at = now() WHERE run_id = $2 AND status = $3`,
+		StepSkipped, runID, StepPending)
+	return err
+}
+
+// ListActiveRunIDs returns the runs that are running or failed_draining.
+func (s *Store) ListActiveRunIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM runs WHERE status IN ($1, $2) ORDER BY created_at`,
+		RunRunning, RunFailedDraining)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // RecordStepRunning notes that a driver accepted a pending step. dispatched_at
 // is only stamped here, on acceptance, because the timeline treats it as the
 // moment the step started occupying its device.
